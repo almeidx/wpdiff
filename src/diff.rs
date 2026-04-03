@@ -129,7 +129,7 @@ pub struct FileDiff {
     pub diff_text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileStatus {
     Added,
@@ -149,10 +149,10 @@ pub enum FileCategory {
 impl std::fmt::Display for FileCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileCategory::Source => write!(f, "source"),
-            FileCategory::Artifact => write!(f, "artifact"),
-            FileCategory::Asset => write!(f, "asset"),
-            FileCategory::Metadata => write!(f, "metadata"),
+            Self::Source => write!(f, "source"),
+            Self::Artifact => write!(f, "artifact"),
+            Self::Asset => write!(f, "asset"),
+            Self::Metadata => write!(f, "metadata"),
         }
     }
 }
@@ -203,15 +203,15 @@ pub fn diff_directories(
 
     for rel_path in &upstream_files {
         if !local_files.contains(rel_path) {
-            trace!("Removed from local: {}", rel_path);
+            trace!("Removed from local: {rel_path}");
             let category = categorize_file(rel_path);
             let upstream_raw = read_file_lossy(&upstream_dir.join(rel_path));
             let upstream_content = prepare_content(&upstream_raw, strict_whitespace);
             let diff_text = make_unified_diff(
                 &upstream_content,
                 "",
-                &format!("a/{}", rel_path),
-                &format!("b/{}", rel_path),
+                &format!("a/{rel_path}"),
+                &format!("b/{rel_path}"),
             );
 
             let (ins, del) = count_changes(&diff_text);
@@ -232,29 +232,7 @@ pub fn diff_directories(
     for rel_path in &local_files {
         let category = categorize_file(rel_path);
 
-        if !upstream_files.contains(rel_path) {
-            trace!("Added locally: {}", rel_path);
-            let local_raw = read_file_lossy(&local_dir.join(rel_path));
-            let local_content = prepare_content(&local_raw, strict_whitespace);
-            let diff_text = make_unified_diff(
-                "",
-                &local_content,
-                &format!("a/{}", rel_path),
-                &format!("b/{}", rel_path),
-            );
-
-            let (ins, del) = count_changes(&diff_text);
-            files.push(FileDiff {
-                path: rel_path.clone(),
-                status: FileStatus::Added,
-                category,
-                insertions: ins,
-                deletions: del,
-                diff_text,
-            });
-            added += 1;
-            CategorySummary::tally(&mut by_category, category, FileStatus::Added);
-        } else {
+        if upstream_files.contains(rel_path) {
             let local_path = local_dir.join(rel_path);
             let upstream_path = upstream_dir.join(rel_path);
 
@@ -280,8 +258,8 @@ pub fn diff_directories(
             let diff_text = make_unified_diff(
                 upstream_cmp,
                 local_cmp,
-                &format!("a/{}", rel_path),
-                &format!("b/{}", rel_path),
+                &format!("a/{rel_path}"),
+                &format!("b/{rel_path}"),
             );
 
             if diff_text.is_empty() {
@@ -301,6 +279,28 @@ pub fn diff_directories(
             });
             modified += 1;
             CategorySummary::tally(&mut by_category, category, FileStatus::Modified);
+        } else {
+            trace!("Added locally: {rel_path}");
+            let local_raw = read_file_lossy(&local_dir.join(rel_path));
+            let local_content = prepare_content(&local_raw, strict_whitespace);
+            let diff_text = make_unified_diff(
+                "",
+                &local_content,
+                &format!("a/{rel_path}"),
+                &format!("b/{rel_path}"),
+            );
+
+            let (ins, del) = count_changes(&diff_text);
+            files.push(FileDiff {
+                path: rel_path.clone(),
+                status: FileStatus::Added,
+                category,
+                insertions: ins,
+                deletions: del,
+                diff_text,
+            });
+            added += 1;
+            CategorySummary::tally(&mut by_category, category, FileStatus::Added);
         }
         pb.inc(1);
     }
@@ -309,8 +309,7 @@ pub fn diff_directories(
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     debug!(
-        "Diff complete: {} added, {} removed, {} modified, {} unchanged",
-        added, removed, modified, unchanged
+        "Diff complete: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
     );
 
     Ok(DiffResult {
@@ -338,7 +337,7 @@ const SKIP_DIRS: &[&str] = &[
     ".DS_Store",
 ];
 
-pub(crate) fn should_skip_dir(name: &std::ffi::OsStr) -> bool {
+pub fn should_skip_dir(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
     SKIP_DIRS.iter().any(|&d| s == d)
 }
@@ -348,6 +347,7 @@ struct CollectResult {
     skipped: Vec<String>,
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn collect_files(dir: &Path) -> Result<CollectResult> {
     use std::cell::RefCell;
 
@@ -355,20 +355,18 @@ fn collect_files(dir: &Path) -> Result<CollectResult> {
     let skipped = RefCell::new(Vec::new());
 
     let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir() && e.depth() > 0 {
-            if let Some(name) = e.path().file_name() {
-                if should_skip_dir(name) {
+        if e.file_type().is_dir() && e.depth() > 0
+            && let Some(name) = e.path().file_name()
+                && should_skip_dir(name) {
                     if e.depth() == 1 {
                         skipped.borrow_mut().push(name.to_string_lossy().to_string());
                     }
                     return false;
                 }
-            }
-        }
         true
     });
 
-    for entry in walker.filter_map(|e| e.ok()) {
+    for entry in walker.filter_map(std::result::Result::ok) {
         if entry.file_type().is_file() {
             let rel = entry
                 .path()
@@ -399,7 +397,7 @@ fn normalize_whitespace(content: &str) -> String {
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .lines()
-        .map(|line| line.trim_end())
+        .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
 }

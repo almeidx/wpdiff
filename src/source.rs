@@ -57,7 +57,7 @@ impl Registry {
 struct WpOrgSource;
 
 impl Source for WpOrgSource {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "wordpress.org"
     }
 
@@ -92,7 +92,6 @@ impl Source for WpOrgSource {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_err = Some(e);
-                    continue;
                 }
             }
         }
@@ -106,19 +105,16 @@ fn download_and_extract(
     url: &str,
     slug: &str,
 ) -> Result<FetchResult> {
-    info!("Downloading {}...", url);
+    info!("Downloading {url}...");
 
     let response = client.get(url).send().with_context(|| {
-        format!(
-            "Failed to connect to downloads.wordpress.org. Check your internet connection."
-        )
+        "Failed to connect to downloads.wordpress.org. Check your internet connection.".to_string()
     })?;
 
     if response.status().as_u16() == 404 {
         bail!(
-            "Plugin zip not found at {}. The plugin may not exist on wordpress.org, \
-             or this version may not be available.",
-            url
+            "Plugin zip not found at {url}. The plugin may not exist on wordpress.org, \
+             or this version may not be available."
         );
     }
     if !response.status().is_success() {
@@ -130,6 +126,7 @@ fn download_and_extract(
     }
 
     let total_size = response.content_length().unwrap_or(0);
+    #[allow(clippy::literal_string_with_formatting_args)]
     let pb = if total_size > 0 {
         progress::bar(total_size, "  {spinner:.green} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})")
     } else {
@@ -156,7 +153,7 @@ fn download_and_extract(
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
     let entry_count = archive.len();
-    debug!("Zip contains {} entries", entry_count);
+    debug!("Zip contains {entry_count} entries");
 
     let extract_pb = progress::bar(
         entry_count as u64,
@@ -189,7 +186,7 @@ fn download_and_extract(
 
     let extracted = temp_dir.path().join("extracted");
     if !extracted.is_dir() {
-        bail!("Extraction produced no files for {}", slug);
+        bail!("Extraction produced no files for {slug}");
     }
 
     Ok(FetchResult {
@@ -198,11 +195,10 @@ fn download_and_extract(
     })
 }
 
-pub(crate) fn strip_top_dir(zip_path: &str) -> String {
-    match zip_path.find('/') {
-        Some(idx) => zip_path[idx + 1..].to_string(),
-        None => String::new(),
-    }
+pub fn strip_top_dir(zip_path: &str) -> String {
+    zip_path
+        .find('/')
+        .map_or_else(String::new, |idx| zip_path[idx + 1..].to_string())
 }
 
 #[derive(Debug)]
@@ -214,11 +210,10 @@ pub struct PluginInfo {
 
 pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
     let url = format!(
-        "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&slug={}&fields=versions",
-        slug
+        "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&slug={slug}&fields=versions"
     );
 
-    debug!("Fetching plugin info from {}", url);
+    debug!("Fetching plugin info from {url}");
 
     let spinner = progress::spinner("  {spinner:.green} Fetching plugin info...");
 
@@ -227,7 +222,7 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         .build()?;
 
     let response = client.get(&url).send().with_context(|| {
-        format!("Failed to connect to api.wordpress.org. Check your internet connection.")
+        "Failed to connect to api.wordpress.org. Check your internet connection.".to_string()
     })?;
 
     spinner.finish_and_clear();
@@ -246,9 +241,8 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
 
     if body.get("error").is_some() {
         bail!(
-            "Plugin '{}' not found on wordpress.org. \
-             Check the slug matches the plugin's directory name.",
-            slug
+            "Plugin '{slug}' not found on wordpress.org. \
+             Check the slug matches the plugin's directory name."
         );
     }
 
@@ -279,7 +273,7 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         .into_iter()
         .map(|v| {
             let key: Vec<u64> = v
-                .split(|c: char| c == '.' || c == '-')
+                .split(['.', '-'])
                 .filter_map(|part| part.parse().ok())
                 .collect();
             (key, v)

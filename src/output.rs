@@ -41,7 +41,7 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
             continue;
         }
 
-        writeln!(out, "{}", format!("── {} ──", label).bold().dimmed())?;
+        writeln!(out, "{}", format!("── {label} ──").bold().dimmed())?;
 
         for file in &cat_files {
             let status_marker = match file.status {
@@ -68,7 +68,7 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
             } else if line.starts_with("@@") {
                 writeln!(out, "{}", line.cyan())?;
             } else {
-                writeln!(out, "{}", line)?;
+                writeln!(out, "{line}")?;
             }
         }
         writeln!(out)?;
@@ -80,15 +80,15 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
 fn render_skipped_dirs(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {
     let local_only: Vec<&str> = result.skipped_dirs.local.iter()
         .filter(|d| !result.skipped_dirs.upstream.contains(d))
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .collect();
     let upstream_only: Vec<&str> = result.skipped_dirs.upstream.iter()
         .filter(|d| !result.skipped_dirs.local.contains(d))
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .collect();
     let both: Vec<&str> = result.skipped_dirs.local.iter()
         .filter(|d| result.skipped_dirs.upstream.contains(d))
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .collect();
 
     if local_only.is_empty() && upstream_only.is_empty() && both.is_empty() {
@@ -150,7 +150,7 @@ fn col_red(val: usize, width: usize, prefix: &str) -> String {
 
 fn col_yellow(val: usize, width: usize) -> String {
     if val > 0 {
-        format!("{:>w$}", val, w = width).yellow().to_string()
+        format!("{val:>width$}").yellow().to_string()
     } else {
         format!("{:>w$}", "·", w = width).dimmed().to_string()
     }
@@ -274,8 +274,7 @@ pub fn render_summary_table(
 
 fn term_width() -> usize {
     terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80)
+        .map_or(80, |(w, _)| w.0 as usize)
 }
 
 pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {
@@ -319,12 +318,12 @@ pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Resu
     for file in &result.files {
         let total = file.insertions + file.deletions;
         let bar_total = if max_changes > 0 {
-            (total * bar_width / max_changes).max(if total > 0 { 1 } else { 0 })
+            (total * bar_width / max_changes).max(usize::from(total > 0))
         } else {
             0
         };
         let bar_ins = if total > 0 {
-            (file.insertions * bar_total / total).max(if file.insertions > 0 { 1 } else { 0 })
+            (file.insertions * bar_total / total).max(usize::from(file.insertions > 0))
         } else {
             0
         };

@@ -54,7 +54,7 @@ enum Command {
     Versions {
         /// Plugin slug or path
         plugin: Option<String>,
-        /// WordPress root directory
+        /// `WordPress` root directory
         #[arg(short = 'C', long = "dir")]
         dir: Option<String>,
         /// Output as JSON
@@ -65,7 +65,7 @@ enum Command {
     Upgrade {
         /// Plugin slug or path
         plugin: Option<String>,
-        /// WordPress root directory
+        /// `WordPress` root directory
         #[arg(short = 'C', long = "dir")]
         dir: Option<String>,
         /// Target version (default: latest)
@@ -88,11 +88,11 @@ struct CommonArgs {
     /// Plugin slug or path to plugin directory
     plugin: Option<String>,
 
-    /// Scan all plugins in a WordPress installation
+    /// Scan all plugins in a `WordPress` installation
     #[arg(long)]
     all: bool,
 
-    /// WordPress root directory
+    /// `WordPress` root directory
     #[arg(short = 'C', long = "dir")]
     dir: Option<String>,
 
@@ -169,10 +169,10 @@ fn main() {
     let cli = Cli::parse();
 
     let (verbose, quiet) = match &cli.command {
-        Some(Command::Summary { common, .. }) | Some(Command::Export { common, .. }) => {
+        Some(Command::Summary { common, .. } | Command::Export { common, .. }) => {
             (common.verbose, common.quiet)
         }
-        Some(Command::Versions { .. }) | Some(Command::Upgrade { .. }) => {
+        Some(Command::Versions { .. } | Command::Upgrade { .. }) => {
             (cli.common.verbose, cli.common.quiet)
         }
         None => (cli.common.verbose, cli.common.quiet),
@@ -181,7 +181,7 @@ fn main() {
     init_logger(verbose, quiet);
 
     if let Err(e) = run(cli) {
-        log::error!("{:#}", e);
+        log::error!("{e:#}");
         std::process::exit(1);
     }
 }
@@ -212,9 +212,9 @@ fn run(cli: Cli) -> Result<()> {
                 Cli::parse_from(["wpdiff", "--help"]);
                 return Ok(());
             }
-            render_command(&cli.common, &cli.filter, RenderMode::Diff)
+            render_command(&cli.common, &cli.filter, &RenderMode::Diff)
         }
-        Some(Command::Summary { common, filter }) => render_command(&common, &filter, RenderMode::Summary),
+        Some(Command::Summary { common, filter }) => render_command(&common, &filter, &RenderMode::Summary),
         Some(Command::Export { output, common, filter }) => cmd_export(&common, &filter, output.as_deref()),
         Some(Command::Versions { plugin, dir, json }) => cmd_versions(plugin.as_deref(), dir.as_deref().map(Path::new), json),
         Some(Command::Upgrade { plugin, dir, to, yes, dry_run, whitespace }) => {
@@ -242,15 +242,15 @@ fn render_output(result: &diff::DiffResult, mode: &RenderMode, json: bool, is_al
     Ok(())
 }
 
-fn render_command(common: &CommonArgs, filter: &FilterArgs, mode: RenderMode) -> Result<()> {
+fn render_command(common: &CommonArgs, filter: &FilterArgs, mode: &RenderMode) -> Result<()> {
     if common.all {
         let is_summary = matches!(mode, RenderMode::Summary);
-        return run_all(common, filter, is_summary, |filtered| render_output(filtered, &mode, filter.json, true));
+        return run_all(common, filter, is_summary, |filtered| render_output(filtered, mode, filter.json, true));
     }
 
     let result = resolve_and_diff(common)?;
     let filtered = filter.apply_filters(&result);
-    render_output(&filtered, &mode, filter.json, false)
+    render_output(&filtered, mode, filter.json, false)
 }
 
 fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -> Result<()> {
@@ -264,7 +264,7 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
         .and_then(|p| plugin::discover_plugin(&p).ok())
         .map(|m| m.version);
 
-    info!("Fetching versions for {}...", slug);
+    info!("Fetching versions for {slug}...");
     let info = source::fetch_plugin_versions(&slug)?;
 
     if json {
@@ -279,12 +279,12 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
         return Ok(());
     }
 
-    println!("{} {}", info.name.bold(), format!("({})", slug).dimmed());
+    println!("{} {}", info.name.bold(), format!("({slug})").dimmed());
 
     if let Some(ref installed) = installed_version {
         println!(
             "  Installed: {}",
-            format!("v{}", installed).yellow().bold()
+            format!("v{installed}").yellow().bold()
         );
     }
     println!(
@@ -296,7 +296,7 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
 
     let display_count = 20;
     let total = info.versions.len();
-    let start = if total > display_count { total - display_count } else { 0 };
+    let start = total.saturating_sub(display_count);
 
     if start > 0 {
         println!("  {} ({} older versions hidden)", "...".dimmed(), start);
@@ -317,34 +317,36 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
         };
 
         let ver_display = if is_installed {
-            format!("v{}", version).yellow().bold().to_string()
+            format!("v{version}").yellow().bold().to_string()
         } else if is_latest {
-            format!("v{}", version).green().to_string()
+            format!("v{version}").green().to_string()
         } else {
-            format!("v{}", version)
+            format!("v{version}")
         };
 
-        println!("    {} {}", ver_display, marker);
+        println!("    {ver_display} {marker}");
     }
 
-    println!("\n  {} versions total", total);
+    println!("\n  {total} versions total");
 
     Ok(())
 }
 
 fn resolve_slug(plugin_arg: &str, base_dir: Option<&Path>) -> String {
-    if let Ok(path) = plugin::resolve_plugin_path(plugin_arg, base_dir) {
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| plugin_arg.to_string())
-    } else {
-        plugin_arg
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(plugin_arg)
-            .to_string()
-    }
+    plugin::resolve_plugin_path(plugin_arg, base_dir).map_or_else(
+        |_| {
+            plugin_arg
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(plugin_arg)
+                .to_string()
+        },
+        |path| {
+            path.file_name()
+                .map_or_else(|| plugin_arg.to_string(), |n| n.to_string_lossy().to_string())
+        },
+    )
 }
 
 fn cmd_export(common: &CommonArgs, filter: &FilterArgs, output_path: Option<&str>) -> Result<()> {
@@ -361,18 +363,18 @@ fn cmd_export(common: &CommonArgs, filter: &FilterArgs, output_path: Option<&str
     };
 
     let file = fs::File::create(&path)
-        .with_context(|| format!("Failed to create patch file {}", path))?;
+        .with_context(|| format!("Failed to create patch file {path}"))?;
     let mut writer = std::io::BufWriter::new(file);
     output::render_unified(&filtered, &mut writer)?;
 
-    info!("Patch exported to {}", path);
+    info!("Patch exported to {path}");
     Ok(())
 }
 
 fn resolve_and_diff(common: &CommonArgs) -> Result<diff::DiffResult> {
     let plugin_arg = common.require_plugin()?;
 
-    debug!("Resolving plugin: {}", plugin_arg);
+    debug!("Resolving plugin: {plugin_arg}");
     let plugin_path = plugin::resolve_plugin_path(plugin_arg, common.base_dir())?;
     diff_single_plugin(&plugin_path, common.whitespace)
 }
@@ -411,7 +413,7 @@ fn run_all(
     use rayon::prelude::*;
 
     let base = common.dir.as_deref().unwrap_or(".");
-    debug!("Scanning all plugins in {}", base);
+    debug!("Scanning all plugins in {base}");
 
     let discovered = plugin::discover_all(Path::new(base))?;
 
@@ -420,7 +422,7 @@ fn run_all(
         .filter_map(|r| match r {
             Ok(meta) => Some(meta),
             Err(e) => {
-                warn!("{:#}", e);
+                warn!("{e:#}");
                 None
             }
         })
@@ -462,13 +464,13 @@ fn run_all(
                 let filtered = filter.apply_filters(&diff_result);
                 if filtered.files.is_empty() {
                     clean_count += 1;
-                    debug!("{}: no differences", slug);
+                    debug!("{slug}: no differences");
                 } else {
                     diffs.push(filtered);
                 }
             }
             Err(e) => {
-                unmatched.push((slug, format!("{:#}", e)));
+                unmatched.push((slug, format!("{e:#}")));
             }
         }
     }
@@ -495,7 +497,7 @@ fn run_all(
 
     if !unmatched.is_empty() {
         for (slug, reason) in &unmatched {
-            warn!("{} - {}", slug, reason);
+            warn!("{slug} - {reason}");
         }
     }
 
@@ -558,13 +560,10 @@ fn cmd_upgrade(
         println!("  No local customizations found.");
     }
 
-    let resolved_version = match target_version {
-        Some(v) => v.to_string(),
-        None => {
-            info!("Checking latest version...");
-            let info = source::fetch_plugin_versions(&meta.slug)?;
-            info.latest_version
-        }
+    let resolved_version = if let Some(v) = target_version { v.to_string() } else {
+        info!("Checking latest version...");
+        let info = source::fetch_plugin_versions(&meta.slug)?;
+        info.latest_version
     };
 
     if resolved_version == meta.version {
@@ -576,14 +575,14 @@ fn cmd_upgrade(
         return Ok(());
     }
 
-    info!("Downloading v{}...", resolved_version);
+    info!("Downloading v{resolved_version}...");
     let new_upstream = registry.fetch(&meta, Some(&resolved_version))?;
     let new_version = &resolved_version;
 
     println!(
         "\n  Upgrading: {} → {}",
         format!("v{}", meta.version).red(),
-        format!("v{}", new_version).green(),
+        format!("v{new_version}").green(),
     );
 
     let patch_text = if has_customizations {
@@ -610,7 +609,7 @@ fn cmd_upgrade(
         info!("Applying customizations to new version...");
 
         let patches = mpatch::parse_patches(patch_text)
-            .map_err(|e| anyhow::anyhow!("Failed to parse patch: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse patch: {e:?}"))?;
 
         let options = mpatch::ApplyOptions::builder()
             .fuzz_factor(0.6)
@@ -629,7 +628,7 @@ fn cmd_upgrade(
                     let failures = patch_result.report.failures();
                     if failures.is_empty() {
                         applied += 1;
-                        debug!("  Applied cleanly: {}", file_str);
+                        debug!("  Applied cleanly: {file_str}");
                     } else {
                         failed += 1;
                         patch_clean = false;
@@ -641,12 +640,14 @@ fn cmd_upgrade(
                         );
 
                         for failure in &failures {
-                            rej_content.push_str(&format!(
+                            use std::fmt::Write as _;
+                            let _ = write!(
+                                rej_content,
                                 "--- Failed hunk #{} in {} ---\n{:?}\n\n",
                                 failure.hunk_index + 1,
                                 file_str,
                                 failure.reason,
-                            ));
+                            );
                         }
                     }
                 }
@@ -699,13 +700,13 @@ fn cmd_upgrade(
 
     if !patch_clean {
         fs::write(&patch_file_path, patch_text.as_deref().unwrap_or(""))
-            .with_context(|| format!("Failed to write {}", patch_file_path))?;
+            .with_context(|| format!("Failed to write {patch_file_path}"))?;
         println!("  Saved patch: {}", patch_file_path.bold());
 
         if !rej_content.is_empty() {
             let rej_path = format!("{}-{}.rej", meta.slug, meta.version);
             fs::write(&rej_path, &rej_content)
-                .with_context(|| format!("Failed to write {}", rej_path))?;
+                .with_context(|| format!("Failed to write {rej_path}"))?;
             println!("  Saved rejected hunks: {}", rej_path.bold());
         }
     }
@@ -716,7 +717,7 @@ fn cmd_upgrade(
         } else {
             "  Replace live plugin? (some customizations failed to apply)"
         };
-        print!("{} [y/N] ", prompt);
+        print!("{prompt} [y/N] ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -727,7 +728,7 @@ fn cmd_upgrade(
     }
 
     let backup_path = format!("{}-{}-backup.zip", meta.slug, meta.version);
-    info!("Backing up current plugin to {}...", backup_path);
+    info!("Backing up current plugin to {backup_path}...");
     create_zip_backup(&meta.dir, &backup_path)?;
 
     info!("Replacing plugin directory...");
@@ -741,7 +742,7 @@ fn cmd_upgrade(
         meta.name,
         new_version,
     );
-    println!("  Backup: {}", backup_path);
+    println!("  Backup: {backup_path}");
 
     Ok(())
 }
@@ -766,7 +767,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 fn create_zip_backup(dir: &Path, zip_path: &str) -> Result<()> {
     let file = fs::File::create(zip_path)
-        .with_context(|| format!("Failed to create {}", zip_path))?;
+        .with_context(|| format!("Failed to create {zip_path}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -780,7 +781,7 @@ fn create_zip_backup(dir: &Path, zip_path: &str) -> Result<()> {
         }
 
         if entry.file_type().is_dir() {
-            zip.add_directory(format!("{}/", rel_str), options)?;
+            zip.add_directory(format!("{rel_str}/"), options)?;
         } else {
             zip.start_file(rel_str.to_string(), options)?;
             let mut f = fs::File::open(entry.path())?;

@@ -20,6 +20,7 @@ fn header_patterns() -> &'static HeaderPatterns {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PluginMeta {
     pub slug: String,
     pub name: String,
@@ -74,11 +75,10 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
     for entry in fs::read_dir(&path)? {
         let entry = entry?;
         let file_path = entry.path();
-        if file_path.extension().is_some_and(|e| e == "php") {
-            if let Some(meta) = parse_plugin_header(&file_path)? {
+        if file_path.extension().is_some_and(|e| e == "php")
+            && let Some(meta) = parse_plugin_header(&file_path)? {
                 return Ok(meta);
             }
-        }
     }
 
     bail!(
@@ -153,8 +153,7 @@ pub fn resolve_plugin_path(slug_or_path: &str, base_dir: Option<&Path>) -> Resul
     }
 
     bail!(
-        "Could not find plugin '{}'. Provide a path or use -C to set the WordPress root.",
-        slug_or_path
+        "Could not find plugin '{slug_or_path}'. Provide a path or use -C to set the WordPress root."
     )
 }
 
