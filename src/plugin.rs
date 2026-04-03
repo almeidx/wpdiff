@@ -31,8 +31,8 @@ pub struct PluginMeta {
 }
 
 pub fn parse_plugin_header(path: &Path) -> Result<Option<PluginMeta>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     let patterns = header_patterns();
 
@@ -76,9 +76,10 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
         let entry = entry?;
         let file_path = entry.path();
         if file_path.extension().is_some_and(|e| e == "php")
-            && let Some(meta) = parse_plugin_header(&file_path)? {
-                return Ok(meta);
-            }
+            && let Some(meta) = parse_plugin_header(&file_path)?
+        {
+            return Ok(meta);
+        }
     }
 
     bail!(
@@ -231,7 +232,11 @@ mod tests {
             "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
         )
         .unwrap();
-        fs::write(plugin_dir.join("helper.php"), "<?php\nfunction helper() {}\n").unwrap();
+        fs::write(
+            plugin_dir.join("helper.php"),
+            "<?php\nfunction helper() {}\n",
+        )
+        .unwrap();
 
         let meta = discover_plugin(&plugin_dir).unwrap();
         assert_eq!(meta.slug, "akismet");
@@ -254,11 +259,7 @@ mod tests {
         let plugin_dir = dir.path().join("test-plugin");
         fs::create_dir(&plugin_dir).unwrap();
 
-        let resolved = resolve_plugin_path(
-            plugin_dir.to_str().unwrap(),
-            None,
-        )
-        .unwrap();
+        let resolved = resolve_plugin_path(plugin_dir.to_str().unwrap(), None).unwrap();
         assert_eq!(resolved, plugin_dir);
     }
 

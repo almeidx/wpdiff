@@ -12,7 +12,12 @@ use crate::plugin::PluginMeta;
 pub trait Source: Send + Sync {
     fn name(&self) -> &str;
     fn can_handle(&self, plugin: &PluginMeta) -> bool;
-    fn fetch(&self, client: &reqwest::blocking::Client, plugin: &PluginMeta, version: Option<&str>) -> Result<FetchResult>;
+    fn fetch(
+        &self,
+        client: &reqwest::blocking::Client,
+        plugin: &PluginMeta,
+        version: Option<&str>,
+    ) -> Result<FetchResult>;
 }
 
 pub struct FetchResult {
@@ -65,7 +70,12 @@ impl Source for WpOrgSource {
         true
     }
 
-    fn fetch(&self, client: &reqwest::blocking::Client, plugin: &PluginMeta, version: Option<&str>) -> Result<FetchResult> {
+    fn fetch(
+        &self,
+        client: &reqwest::blocking::Client,
+        plugin: &PluginMeta,
+        version: Option<&str>,
+    ) -> Result<FetchResult> {
         let ver = version.unwrap_or(&plugin.version);
 
         let urls = if ver.is_empty() {
@@ -79,10 +89,7 @@ impl Source for WpOrgSource {
                     "https://downloads.wordpress.org/plugin/{}.{}.zip",
                     plugin.slug, ver
                 ),
-                format!(
-                    "https://downloads.wordpress.org/plugin/{}.zip",
-                    plugin.slug
-                ),
+                format!("https://downloads.wordpress.org/plugin/{}.zip", plugin.slug),
             ]
         };
 
@@ -128,7 +135,10 @@ fn download_and_extract(
     let total_size = response.content_length().unwrap_or(0);
     #[allow(clippy::literal_string_with_formatting_args)]
     let pb = if total_size > 0 {
-        progress::bar(total_size, "  {spinner:.green} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})")
+        progress::bar(
+            total_size,
+            "  {spinner:.green} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
+        )
     } else {
         progress::spinner("  {spinner:.green} {bytes} downloaded ({bytes_per_sec})")
     };
@@ -261,12 +271,7 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
     let versions: Vec<String> = body
         .get("versions")
         .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.keys()
-                .filter(|k| *k != "trunk")
-                .cloned()
-                .collect()
-        })
+        .map(|obj| obj.keys().filter(|k| *k != "trunk").cloned().collect())
         .unwrap_or_default();
 
     let mut keyed: Vec<(Vec<u64>, String)> = versions
@@ -300,10 +305,7 @@ mod tests {
 
     #[test]
     fn strip_top_dir_nested() {
-        assert_eq!(
-            strip_top_dir("akismet/languages/en.po"),
-            "languages/en.po"
-        );
+        assert_eq!(strip_top_dir("akismet/languages/en.po"), "languages/en.po");
     }
 
     #[test]

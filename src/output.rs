@@ -6,11 +6,7 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
     writeln!(
         out,
         "{}",
-        format!(
-            "wpdiff: {} v{}",
-            result.plugin_slug, result.plugin_version
-        )
-        .bold()
+        format!("wpdiff: {} v{}", result.plugin_slug, result.plugin_version).bold()
     )?;
     writeln!(
         out,
@@ -36,7 +32,8 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
     ];
 
     for (cat, label) in &categories {
-        let cat_files: Vec<&FileDiff> = result.files.iter().filter(|f| f.category == *cat).collect();
+        let cat_files: Vec<&FileDiff> =
+            result.files.iter().filter(|f| f.category == *cat).collect();
         if cat_files.is_empty() {
             continue;
         }
@@ -78,15 +75,24 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
 }
 
 fn render_skipped_dirs(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {
-    let local_only: Vec<&str> = result.skipped_dirs.local.iter()
+    let local_only: Vec<&str> = result
+        .skipped_dirs
+        .local
+        .iter()
         .filter(|d| !result.skipped_dirs.upstream.contains(d))
         .map(std::string::String::as_str)
         .collect();
-    let upstream_only: Vec<&str> = result.skipped_dirs.upstream.iter()
+    let upstream_only: Vec<&str> = result
+        .skipped_dirs
+        .upstream
+        .iter()
         .filter(|d| !result.skipped_dirs.local.contains(d))
         .map(std::string::String::as_str)
         .collect();
-    let both: Vec<&str> = result.skipped_dirs.local.iter()
+    let both: Vec<&str> = result
+        .skipped_dirs
+        .local
+        .iter()
         .filter(|d| result.skipped_dirs.upstream.contains(d))
         .map(std::string::String::as_str)
         .collect();
@@ -100,10 +106,22 @@ fn render_skipped_dirs(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
         writeln!(out, "  {} {}/", "=".dimmed(), dir)?;
     }
     for dir in &local_only {
-        writeln!(out, "  {} {}/ {}", "+".green().bold(), dir, "(local only)".dimmed())?;
+        writeln!(
+            out,
+            "  {} {}/ {}",
+            "+".green().bold(),
+            dir,
+            "(local only)".dimmed()
+        )?;
     }
     for dir in &upstream_only {
-        writeln!(out, "  {} {}/ {}", "-".red().bold(), dir, "(upstream only)".dimmed())?;
+        writeln!(
+            out,
+            "  {} {}/ {}",
+            "-".red().bold(),
+            dir,
+            "(upstream only)".dimmed()
+        )?;
     }
     writeln!(out)?;
 
@@ -193,7 +211,11 @@ pub fn render_summary_table(
         "Del(-)".bold().underline(),
         name_w = max_name,
         ver_w = max_ver,
-        cw0 = cw[0], cw1 = cw[1], cw2 = cw[2], cw3 = cw[3], cw4 = cw[4],
+        cw0 = cw[0],
+        cw1 = cw[1],
+        cw2 = cw[2],
+        cw3 = cw[3],
+        cw4 = cw[4],
     )?;
 
     let mut total_added = 0;
@@ -228,7 +250,9 @@ pub fn render_summary_table(
     }
 
     if results.len() > 1 {
-        writeln!(out, " {:<name_w$}  {:<ver_w$}  {}  {}  {}  {}  {}",
+        writeln!(
+            out,
+            " {:<name_w$}  {:<ver_w$}  {}  {}  {}  {}  {}",
             "".dimmed(),
             "".dimmed(),
             "─".repeat(cw[0]).dimmed(),
@@ -273,8 +297,7 @@ pub fn render_summary_table(
 }
 
 fn term_width() -> usize {
-    terminal_size::terminal_size()
-        .map_or(80, |(w, _)| w.0 as usize)
+    terminal_size::terminal_size().map_or(80, |(w, _)| w.0 as usize)
 }
 
 pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {

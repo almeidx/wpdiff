@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use diff::FileCategory;
-use log::{debug, info, warn, LevelFilter};
+use log::{LevelFilter, debug, info, warn};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
@@ -214,12 +214,32 @@ fn run(cli: Cli) -> Result<()> {
             }
             render_command(&cli.common, &cli.filter, &RenderMode::Diff)
         }
-        Some(Command::Summary { common, filter }) => render_command(&common, &filter, &RenderMode::Summary),
-        Some(Command::Export { output, common, filter }) => cmd_export(&common, &filter, output.as_deref()),
-        Some(Command::Versions { plugin, dir, json }) => cmd_versions(plugin.as_deref(), dir.as_deref().map(Path::new), json),
-        Some(Command::Upgrade { plugin, dir, to, yes, dry_run, whitespace }) => {
-            cmd_upgrade(plugin.as_deref(), dir.as_deref().map(Path::new), to.as_deref(), yes, dry_run, whitespace)
+        Some(Command::Summary { common, filter }) => {
+            render_command(&common, &filter, &RenderMode::Summary)
         }
+        Some(Command::Export {
+            output,
+            common,
+            filter,
+        }) => cmd_export(&common, &filter, output.as_deref()),
+        Some(Command::Versions { plugin, dir, json }) => {
+            cmd_versions(plugin.as_deref(), dir.as_deref().map(Path::new), json)
+        }
+        Some(Command::Upgrade {
+            plugin,
+            dir,
+            to,
+            yes,
+            dry_run,
+            whitespace,
+        }) => cmd_upgrade(
+            plugin.as_deref(),
+            dir.as_deref().map(Path::new),
+            to.as_deref(),
+            yes,
+            dry_run,
+            whitespace,
+        ),
     }
 }
 
@@ -228,7 +248,12 @@ enum RenderMode {
     Summary,
 }
 
-fn render_output(result: &diff::DiffResult, mode: &RenderMode, json: bool, is_all: bool) -> Result<()> {
+fn render_output(
+    result: &diff::DiffResult,
+    mode: &RenderMode,
+    json: bool,
+    is_all: bool,
+) -> Result<()> {
     let mut out = std::io::stdout().lock();
     if json {
         output::render_json(result, &mut out)?;
@@ -245,7 +270,9 @@ fn render_output(result: &diff::DiffResult, mode: &RenderMode, json: bool, is_al
 fn render_command(common: &CommonArgs, filter: &FilterArgs, mode: &RenderMode) -> Result<()> {
     if common.all {
         let is_summary = matches!(mode, RenderMode::Summary);
-        return run_all(common, filter, is_summary, |filtered| render_output(filtered, mode, filter.json, true));
+        return run_all(common, filter, is_summary, |filtered| {
+            render_output(filtered, mode, filter.json, true)
+        });
     }
 
     let result = resolve_and_diff(common)?;
@@ -254,8 +281,7 @@ fn render_command(common: &CommonArgs, filter: &FilterArgs, mode: &RenderMode) -
 }
 
 fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -> Result<()> {
-    let plugin_arg = plugin_arg
-        .ok_or_else(|| anyhow::anyhow!("Provide a plugin slug"))?;
+    let plugin_arg = plugin_arg.ok_or_else(|| anyhow::anyhow!("Provide a plugin slug"))?;
 
     let slug = resolve_slug(plugin_arg, base_dir);
 
@@ -282,10 +308,7 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
     println!("{} {}", info.name.bold(), format!("({slug})").dimmed());
 
     if let Some(ref installed) = installed_version {
-        println!(
-            "  Installed: {}",
-            format!("v{installed}").yellow().bold()
-        );
+        println!("  Installed: {}", format!("v{installed}").yellow().bold());
     }
     println!(
         "  Latest:    {}",
@@ -343,8 +366,10 @@ fn resolve_slug(plugin_arg: &str, base_dir: Option<&Path>) -> String {
                 .to_string()
         },
         |path| {
-            path.file_name()
-                .map_or_else(|| plugin_arg.to_string(), |n| n.to_string_lossy().to_string())
+            path.file_name().map_or_else(
+                || plugin_arg.to_string(),
+                |n| n.to_string_lossy().to_string(),
+            )
         },
     )
 }
@@ -362,8 +387,8 @@ fn cmd_export(common: &CommonArgs, filter: &FilterArgs, output_path: Option<&str
         None => format!("{}-{}.patch", filtered.plugin_slug, filtered.plugin_version),
     };
 
-    let file = fs::File::create(&path)
-        .with_context(|| format!("Failed to create patch file {path}"))?;
+    let file =
+        fs::File::create(&path).with_context(|| format!("Failed to create patch file {path}"))?;
     let mut writer = std::io::BufWriter::new(file);
     output::render_unified(&filtered, &mut writer)?;
 
@@ -384,10 +409,17 @@ fn diff_single_plugin(plugin_path: &Path, strict_whitespace: bool) -> Result<dif
     diff_plugin_with_registry(&registry, plugin_path, strict_whitespace)
 }
 
-fn diff_plugin_with_registry(registry: &source::Registry, plugin_path: &Path, strict_whitespace: bool) -> Result<diff::DiffResult> {
+fn diff_plugin_with_registry(
+    registry: &source::Registry,
+    plugin_path: &Path,
+    strict_whitespace: bool,
+) -> Result<diff::DiffResult> {
     let meta = plugin::discover_plugin(plugin_path)?;
 
-    info!("Comparing {} v{} against upstream...", meta.name, meta.version);
+    info!(
+        "Comparing {} v{} against upstream...",
+        meta.name, meta.version
+    );
     debug!("Plugin directory: {}", meta.dir.display());
     debug!("Main file: {}", meta.main_file.display());
 
@@ -476,7 +508,12 @@ fn run_all(
     }
 
     if is_summary && !filter.json {
-        output::render_summary_table(&diffs, clean_count, unmatched.len(), &mut std::io::stdout().lock())?;
+        output::render_summary_table(
+            &diffs,
+            clean_count,
+            unmatched.len(),
+            &mut std::io::stdout().lock(),
+        )?;
     } else if diffs.is_empty() && unmatched.is_empty() {
         info!("All plugins match their upstream versions.");
         return Ok(());
@@ -490,7 +527,9 @@ fn run_all(
             writeln!(
                 out,
                 "{} changed, {} unchanged, {} unmatched",
-                diffs.len(), clean_count, unmatched.len()
+                diffs.len(),
+                clean_count,
+                unmatched.len()
             )?;
         }
     }
@@ -512,8 +551,8 @@ fn cmd_upgrade(
     dry_run: bool,
     whitespace: bool,
 ) -> Result<()> {
-    let plugin_arg = plugin_arg
-        .ok_or_else(|| anyhow::anyhow!("Provide a plugin slug or path to upgrade"))?;
+    let plugin_arg =
+        plugin_arg.ok_or_else(|| anyhow::anyhow!("Provide a plugin slug or path to upgrade"))?;
 
     let plugin_path = plugin::resolve_plugin_path(plugin_arg, base_dir)?;
     let meta = plugin::discover_plugin(&plugin_path)?;
@@ -537,10 +576,9 @@ fn cmd_upgrade(
         whitespace,
     )?;
 
-    let patch_categories: HashSet<FileCategory> =
-        [FileCategory::Source, FileCategory::Metadata]
-            .into_iter()
-            .collect();
+    let patch_categories: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata]
+        .into_iter()
+        .collect();
     let filtered = diff_result.apply(&patch_categories, &[]);
     let has_customizations = !filtered.files.is_empty();
 
@@ -560,7 +598,9 @@ fn cmd_upgrade(
         println!("  No local customizations found.");
     }
 
-    let resolved_version = if let Some(v) = target_version { v.to_string() } else {
+    let resolved_version = if let Some(v) = target_version {
+        v.to_string()
+    } else {
         info!("Checking latest version...");
         let info = source::fetch_plugin_versions(&meta.slug)?;
         info.latest_version
@@ -611,9 +651,7 @@ fn cmd_upgrade(
         let patches = mpatch::parse_patches(patch_text)
             .map_err(|e| anyhow::anyhow!("Failed to parse patch: {e:?}"))?;
 
-        let options = mpatch::ApplyOptions::builder()
-            .fuzz_factor(0.6)
-            .build();
+        let options = mpatch::ApplyOptions::builder().fuzz_factor(0.6).build();
 
         let batch = mpatch::apply_patches_to_dir(&patches, &staged_plugin, options);
 
@@ -682,17 +720,21 @@ fn cmd_upgrade(
         if !has_customizations {
             println!(
                 "  {} Dry run complete. Upgrade v{} → v{} would apply cleanly (no customizations).",
-                "✓".green().bold(), meta.version, new_version,
+                "✓".green().bold(),
+                meta.version,
+                new_version,
             );
         } else if patch_clean {
             println!(
                 "  {} Dry run complete. All customizations would reapply cleanly after upgrade to v{}.",
-                "✓".green().bold(), new_version,
+                "✓".green().bold(),
+                new_version,
             );
         } else {
             println!(
                 "  {} Dry run complete. Some customizations would fail to reapply after upgrade to v{}.",
-                "⚠".yellow().bold(), new_version,
+                "⚠".yellow().bold(),
+                new_version,
             );
         }
         return Ok(());
@@ -722,7 +764,10 @@ fn cmd_upgrade(
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
         if !answer.trim().eq_ignore_ascii_case("y") {
-            println!("  Aborted. Staged version is in: {}", staged_plugin.display());
+            println!(
+                "  Aborted. Staged version is in: {}",
+                staged_plugin.display()
+            );
             return Ok(());
         }
     }
@@ -766,8 +811,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn create_zip_backup(dir: &Path, zip_path: &str) -> Result<()> {
-    let file = fs::File::create(zip_path)
-        .with_context(|| format!("Failed to create {zip_path}"))?;
+    let file =
+        fs::File::create(zip_path).with_context(|| format!("Failed to create {zip_path}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);

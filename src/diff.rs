@@ -54,11 +54,7 @@ impl DiffResult {
         }
     }
 
-    pub fn apply(
-        &self,
-        categories: &HashSet<FileCategory>,
-        exclude_patterns: &[String],
-    ) -> Self {
+    pub fn apply(&self, categories: &HashSet<FileCategory>, exclude_patterns: &[String]) -> Self {
         let expanded: Vec<String> = exclude_patterns
             .iter()
             .flat_map(|p| {
@@ -82,9 +78,7 @@ impl DiffResult {
             .filter(|f| {
                 categories.contains(&f.category)
                     && (expanded.is_empty()
-                        || !expanded
-                            .iter()
-                            .any(|p| glob_match::glob_match(p, &f.path)))
+                        || !expanded.iter().any(|p| glob_match::glob_match(p, &f.path)))
             })
             .cloned()
             .collect();
@@ -185,7 +179,10 @@ pub fn diff_directories(
         debug!("Skipped local dirs: {}", skipped_dirs.local.join(", "));
     }
     if !skipped_dirs.upstream.is_empty() {
-        debug!("Skipped upstream dirs: {}", skipped_dirs.upstream.join(", "));
+        debug!(
+            "Skipped upstream dirs: {}",
+            skipped_dirs.upstream.join(", ")
+        );
     }
 
     let mut files = Vec::new();
@@ -355,14 +352,18 @@ fn collect_files(dir: &Path) -> Result<CollectResult> {
     let skipped = RefCell::new(Vec::new());
 
     let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir() && e.depth() > 0
+        if e.file_type().is_dir()
+            && e.depth() > 0
             && let Some(name) = e.path().file_name()
-                && should_skip_dir(name) {
-                    if e.depth() == 1 {
-                        skipped.borrow_mut().push(name.to_string_lossy().to_string());
-                    }
-                    return false;
-                }
+            && should_skip_dir(name)
+        {
+            if e.depth() == 1 {
+                skipped
+                    .borrow_mut()
+                    .push(name.to_string_lossy().to_string());
+            }
+            return false;
+        }
         true
     });
 
@@ -422,8 +423,6 @@ fn prepare_content(raw: &str, strict_whitespace: bool) -> String {
     }
 }
 
-
-
 fn count_changes(diff_text: &str) -> (usize, usize) {
     let mut insertions = 0;
     let mut deletions = 0;
@@ -440,13 +439,7 @@ fn count_changes(diff_text: &str) -> (usize, usize) {
 pub fn categorize_file(path: &str) -> FileCategory {
     let lower = path.to_lowercase();
 
-    let artifact_dirs = [
-        "node_modules/",
-        "vendor/",
-        "dist/",
-        "build/",
-        ".git/",
-    ];
+    let artifact_dirs = ["node_modules/", "vendor/", "dist/", "build/", ".git/"];
     for dir in &artifact_dirs {
         if lower.contains(dir) {
             return FileCategory::Artifact;
@@ -463,10 +456,9 @@ pub fn categorize_file(path: &str) -> FileCategory {
     }
 
     let asset_exts = [
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff",
-        ".woff", ".woff2", ".ttf", ".eot", ".otf",
-        ".mp3", ".mp4", ".wav", ".ogg", ".webm",
-        ".zip", ".tar", ".gz",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff", ".woff",
+        ".woff2", ".ttf", ".eot", ".otf", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".zip", ".tar",
+        ".gz",
     ];
     for ext in &asset_exts {
         if lower.ends_with(ext) {
@@ -507,7 +499,10 @@ mod tests {
     #[test]
     fn categorize_source_files() {
         assert_eq!(categorize_file("src/foo.php"), FileCategory::Source);
-        assert_eq!(categorize_file("includes/class-wc.php"), FileCategory::Source);
+        assert_eq!(
+            categorize_file("includes/class-wc.php"),
+            FileCategory::Source
+        );
         assert_eq!(categorize_file("style.css"), FileCategory::Source);
         assert_eq!(categorize_file("app.js"), FileCategory::Source);
         assert_eq!(categorize_file("template.html"), FileCategory::Source);
@@ -515,8 +510,14 @@ mod tests {
 
     #[test]
     fn categorize_artifacts_by_dir() {
-        assert_eq!(categorize_file("node_modules/lodash/index.js"), FileCategory::Artifact);
-        assert_eq!(categorize_file("vendor/autoload.php"), FileCategory::Artifact);
+        assert_eq!(
+            categorize_file("node_modules/lodash/index.js"),
+            FileCategory::Artifact
+        );
+        assert_eq!(
+            categorize_file("vendor/autoload.php"),
+            FileCategory::Artifact
+        );
         assert_eq!(categorize_file("dist/bundle.js"), FileCategory::Artifact);
         assert_eq!(categorize_file("build/output.css"), FileCategory::Artifact);
         assert_eq!(categorize_file(".git/config"), FileCategory::Artifact);
@@ -547,14 +548,20 @@ mod tests {
         assert_eq!(categorize_file("changelog.txt"), FileCategory::Metadata);
         assert_eq!(categorize_file("LICENSE.txt"), FileCategory::Metadata);
         assert_eq!(categorize_file("license"), FileCategory::Metadata);
-        assert_eq!(categorize_file("languages/plugin.pot"), FileCategory::Metadata);
+        assert_eq!(
+            categorize_file("languages/plugin.pot"),
+            FileCategory::Metadata
+        );
         assert_eq!(categorize_file("languages/en.po"), FileCategory::Metadata);
         assert_eq!(categorize_file("languages/en.mo"), FileCategory::Metadata);
     }
 
     #[test]
     fn categorize_artifact_dir_mid_path() {
-        assert_eq!(categorize_file("src/dist/output.js"), FileCategory::Artifact);
+        assert_eq!(
+            categorize_file("src/dist/output.js"),
+            FileCategory::Artifact
+        );
     }
 
     #[test]
@@ -661,7 +668,7 @@ mod tests {
             ("logo.png", FileCategory::Asset, FileStatus::Added),
         ]);
 
-        let cats: HashSet<FileCategory> = [FileCategory::Source].into_iter().collect();
+        let cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
         let filtered = result.apply(&cats, &[]);
         assert_eq!(filtered.files.len(), 1);
         assert_eq!(filtered.files[0].path, "src/a.php");
@@ -670,11 +677,21 @@ mod tests {
     #[test]
     fn apply_filters_exclude_bare_name() {
         let result = make_test_result(vec![
-            ("assets/js/app.js", FileCategory::Source, FileStatus::Modified),
-            ("includes/foo.php", FileCategory::Source, FileStatus::Modified),
+            (
+                "assets/js/app.js",
+                FileCategory::Source,
+                FileStatus::Modified,
+            ),
+            (
+                "includes/foo.php",
+                FileCategory::Source,
+                FileStatus::Modified,
+            ),
         ]);
 
-        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata].into_iter().collect();
+        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata]
+            .into_iter()
+            .collect();
         let filtered = result.apply(&all_cats, &["assets".to_string()]);
         assert_eq!(filtered.files.len(), 1);
         assert_eq!(filtered.files[0].path, "includes/foo.php");
@@ -687,7 +704,7 @@ mod tests {
             ("src/b.js", FileCategory::Source, FileStatus::Modified),
         ]);
 
-        let all_cats: HashSet<FileCategory> = [FileCategory::Source].into_iter().collect();
+        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
         let filtered = result.apply(&all_cats, &["**/*.js".to_string()]);
         assert_eq!(filtered.files.len(), 1);
         assert_eq!(filtered.files[0].path, "src/a.php");
