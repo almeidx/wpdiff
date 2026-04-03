@@ -198,7 +198,7 @@ fn download_and_extract(
     })
 }
 
-fn strip_top_dir(zip_path: &str) -> String {
+pub(crate) fn strip_top_dir(zip_path: &str) -> String {
     match zip_path.find('/') {
         Some(idx) => zip_path[idx + 1..].to_string(),
         None => String::new(),
@@ -293,4 +293,37 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         latest_version,
         versions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_top_dir_normal() {
+        assert_eq!(strip_top_dir("akismet/akismet.php"), "akismet.php");
+    }
+
+    #[test]
+    fn strip_top_dir_nested() {
+        assert_eq!(
+            strip_top_dir("akismet/languages/en.po"),
+            "languages/en.po"
+        );
+    }
+
+    #[test]
+    fn strip_top_dir_directory_entry() {
+        assert_eq!(strip_top_dir("akismet/"), "");
+    }
+
+    #[test]
+    fn strip_top_dir_no_slash() {
+        assert_eq!(strip_top_dir("file.txt"), "");
+    }
+
+    #[test]
+    fn strip_top_dir_empty() {
+        assert_eq!(strip_top_dir(""), "");
+    }
 }

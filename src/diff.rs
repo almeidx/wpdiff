@@ -338,7 +338,7 @@ const SKIP_DIRS: &[&str] = &[
     ".DS_Store",
 ];
 
-fn should_skip_dir(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn should_skip_dir(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
     SKIP_DIRS.iter().any(|&d| s == d)
 }
@@ -500,4 +500,227 @@ pub fn categorize_file(path: &str) -> FileCategory {
     }
 
     FileCategory::Source
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categorize_source_files() {
+        assert_eq!(categorize_file("src/foo.php"), FileCategory::Source);
+        assert_eq!(categorize_file("includes/class-wc.php"), FileCategory::Source);
+        assert_eq!(categorize_file("style.css"), FileCategory::Source);
+        assert_eq!(categorize_file("app.js"), FileCategory::Source);
+        assert_eq!(categorize_file("template.html"), FileCategory::Source);
+    }
+
+    #[test]
+    fn categorize_artifacts_by_dir() {
+        assert_eq!(categorize_file("node_modules/lodash/index.js"), FileCategory::Artifact);
+        assert_eq!(categorize_file("vendor/autoload.php"), FileCategory::Artifact);
+        assert_eq!(categorize_file("dist/bundle.js"), FileCategory::Artifact);
+        assert_eq!(categorize_file("build/output.css"), FileCategory::Artifact);
+        assert_eq!(categorize_file(".git/config"), FileCategory::Artifact);
+    }
+
+    #[test]
+    fn categorize_artifacts_by_extension() {
+        assert_eq!(categorize_file("app.min.js"), FileCategory::Artifact);
+        assert_eq!(categorize_file("style.min.css"), FileCategory::Artifact);
+        assert_eq!(categorize_file("app.bundle.js"), FileCategory::Artifact);
+        assert_eq!(categorize_file("vendor.chunk.js"), FileCategory::Artifact);
+        assert_eq!(categorize_file("app.js.map"), FileCategory::Artifact);
+    }
+
+    #[test]
+    fn categorize_assets() {
+        assert_eq!(categorize_file("logo.png"), FileCategory::Asset);
+        assert_eq!(categorize_file("photo.jpg"), FileCategory::Asset);
+        assert_eq!(categorize_file("icon.svg"), FileCategory::Asset);
+        assert_eq!(categorize_file("font.woff2"), FileCategory::Asset);
+        assert_eq!(categorize_file("video.mp4"), FileCategory::Asset);
+    }
+
+    #[test]
+    fn categorize_metadata() {
+        assert_eq!(categorize_file("readme.txt"), FileCategory::Metadata);
+        assert_eq!(categorize_file("README.md"), FileCategory::Metadata);
+        assert_eq!(categorize_file("changelog.txt"), FileCategory::Metadata);
+        assert_eq!(categorize_file("LICENSE.txt"), FileCategory::Metadata);
+        assert_eq!(categorize_file("license"), FileCategory::Metadata);
+        assert_eq!(categorize_file("languages/plugin.pot"), FileCategory::Metadata);
+        assert_eq!(categorize_file("languages/en.po"), FileCategory::Metadata);
+        assert_eq!(categorize_file("languages/en.mo"), FileCategory::Metadata);
+    }
+
+    #[test]
+    fn categorize_artifact_dir_mid_path() {
+        assert_eq!(categorize_file("src/dist/output.js"), FileCategory::Artifact);
+    }
+
+    #[test]
+    fn normalize_crlf() {
+        assert_eq!(normalize_whitespace("a\r\nb\r\n"), "a\nb");
+        assert_eq!(normalize_whitespace("a\rb\r"), "a\nb");
+    }
+
+    #[test]
+    fn normalize_trailing_spaces() {
+        assert_eq!(normalize_whitespace("hello   \nworld\t\n"), "hello\nworld");
+    }
+
+    #[test]
+    fn normalize_empty() {
+        assert_eq!(normalize_whitespace(""), "");
+    }
+
+    #[test]
+    fn count_changes_basic() {
+        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n context\n";
+        let (ins, del) = count_changes(diff);
+        assert_eq!(ins, 1);
+        assert_eq!(del, 1);
+    }
+
+    #[test]
+    fn count_changes_excludes_headers() {
+        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let (ins, del) = count_changes(diff);
+        assert_eq!(ins, 1);
+        assert_eq!(del, 1);
+    }
+
+    #[test]
+    fn count_changes_empty() {
+        assert_eq!(count_changes(""), (0, 0));
+    }
+
+    #[test]
+    fn make_diff_identical() {
+        assert_eq!(make_unified_diff("hello\n", "hello\n", "a", "b"), "");
+    }
+
+    #[test]
+    fn make_diff_added() {
+        let diff = make_unified_diff("", "new line\n", "a/f", "b/f");
+        assert!(diff.contains("+new line"));
+        assert!(diff.contains("--- a/f"));
+        assert!(diff.contains("+++ b/f"));
+    }
+
+    #[test]
+    fn make_diff_removed() {
+        let diff = make_unified_diff("old line\n", "", "a/f", "b/f");
+        assert!(diff.contains("-old line"));
+    }
+
+    #[test]
+    fn skip_dir_known() {
+        assert!(should_skip_dir(std::ffi::OsStr::new("node_modules")));
+        assert!(should_skip_dir(std::ffi::OsStr::new("vendor")));
+        assert!(should_skip_dir(std::ffi::OsStr::new(".git")));
+        assert!(should_skip_dir(std::ffi::OsStr::new("external")));
+    }
+
+    #[test]
+    fn skip_dir_not_prefix() {
+        assert!(!should_skip_dir(std::ffi::OsStr::new("vendor_custom")));
+        assert!(!should_skip_dir(std::ffi::OsStr::new("src")));
+        assert!(!should_skip_dir(std::ffi::OsStr::new("includes")));
+    }
+
+    #[test]
+    fn tally_increments_correctly() {
+        let mut map = BTreeMap::new();
+        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Added);
+        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Added);
+        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Modified);
+        CategorySummary::tally(&mut map, FileCategory::Asset, FileStatus::Removed);
+
+        assert_eq!(map[&FileCategory::Source].added, 2);
+        assert_eq!(map[&FileCategory::Source].modified, 1);
+        assert_eq!(map[&FileCategory::Source].removed, 0);
+        assert_eq!(map[&FileCategory::Asset].removed, 1);
+    }
+
+    #[test]
+    fn prepare_content_strict_preserves_crlf() {
+        let raw = "hello\r\nworld\r\n";
+        assert_eq!(prepare_content(raw, true), raw);
+    }
+
+    #[test]
+    fn prepare_content_nonstrict_normalizes() {
+        assert_eq!(prepare_content("hello\r\n", false), "hello");
+    }
+
+    #[test]
+    fn apply_filters_categories() {
+        let result = make_test_result(vec![
+            ("src/a.php", FileCategory::Source, FileStatus::Modified),
+            ("app.min.js", FileCategory::Artifact, FileStatus::Modified),
+            ("logo.png", FileCategory::Asset, FileStatus::Added),
+        ]);
+
+        let cats: HashSet<FileCategory> = [FileCategory::Source].into_iter().collect();
+        let filtered = result.apply(&cats, &[]);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "src/a.php");
+    }
+
+    #[test]
+    fn apply_filters_exclude_bare_name() {
+        let result = make_test_result(vec![
+            ("assets/js/app.js", FileCategory::Source, FileStatus::Modified),
+            ("includes/foo.php", FileCategory::Source, FileStatus::Modified),
+        ]);
+
+        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata].into_iter().collect();
+        let filtered = result.apply(&all_cats, &["assets".to_string()]);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "includes/foo.php");
+    }
+
+    #[test]
+    fn apply_filters_exclude_glob() {
+        let result = make_test_result(vec![
+            ("src/a.php", FileCategory::Source, FileStatus::Modified),
+            ("src/b.js", FileCategory::Source, FileStatus::Modified),
+        ]);
+
+        let all_cats: HashSet<FileCategory> = [FileCategory::Source].into_iter().collect();
+        let filtered = result.apply(&all_cats, &["**/*.js".to_string()]);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "src/a.php");
+    }
+
+    fn make_test_result(files: Vec<(&str, FileCategory, FileStatus)>) -> DiffResult {
+        DiffResult {
+            plugin_slug: "test".to_string(),
+            plugin_version: "1.0".to_string(),
+            files: files
+                .into_iter()
+                .map(|(path, category, status)| FileDiff {
+                    path: path.to_string(),
+                    status,
+                    category,
+                    insertions: 0,
+                    deletions: 0,
+                    diff_text: String::new(),
+                })
+                .collect(),
+            skipped_dirs: SkippedDirs {
+                local: vec![],
+                upstream: vec![],
+            },
+            summary: DiffSummary {
+                added: 0,
+                removed: 0,
+                modified: 0,
+                unchanged: 0,
+                by_category: BTreeMap::new(),
+            },
+        }
+    }
 }
