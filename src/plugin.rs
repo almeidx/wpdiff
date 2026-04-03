@@ -82,7 +82,9 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
     }
 
     bail!(
-        "No plugin header found in {}. Is this a WordPress plugin directory?",
+        "No WordPress plugin header found in {}.\n\
+         Expected a PHP file with a 'Plugin Name:' header.\n\
+         Make sure you're pointing at a plugin directory (e.g. wp-content/plugins/akismet).",
         path.display()
     )
 }
@@ -115,7 +117,8 @@ fn find_plugins_dir(path: &Path) -> Result<PathBuf> {
     }
 
     bail!(
-        "Could not find wp-content/plugins directory from: {}",
+        "Could not find wp-content/plugins/ in {}.\n\
+         Use -C to specify the WordPress root directory.",
         path.display()
     )
 }

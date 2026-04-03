@@ -108,13 +108,25 @@ fn download_and_extract(
 ) -> Result<FetchResult> {
     info!("Downloading {}...", url);
 
-    let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("Failed to download {}", url))?;
+    let response = client.get(url).send().with_context(|| {
+        format!(
+            "Failed to connect to downloads.wordpress.org. Check your internet connection."
+        )
+    })?;
 
+    if response.status().as_u16() == 404 {
+        bail!(
+            "Plugin zip not found at {}. The plugin may not exist on wordpress.org, \
+             or this version may not be available.",
+            url
+        );
+    }
     if !response.status().is_success() {
-        bail!("HTTP {} for {}", response.status(), url);
+        bail!(
+            "HTTP {} from wordpress.org for {}. Try again later.",
+            response.status(),
+            url
+        );
     }
 
     let total_size = response.content_length().unwrap_or(0);
@@ -214,21 +226,28 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let response = client.get(&url).send()
-        .with_context(|| format!("Failed to query wordpress.org for '{}'", slug))?;
+    let response = client.get(&url).send().with_context(|| {
+        format!("Failed to connect to api.wordpress.org. Check your internet connection.")
+    })?;
 
     spinner.finish_and_clear();
 
     if !response.status().is_success() {
-        bail!("HTTP {} from wordpress.org API for '{}'", response.status(), slug);
+        bail!(
+            "wordpress.org API returned HTTP {} for '{}'. Try again later.",
+            response.status(),
+            slug
+        );
     }
 
-    let body: serde_json::Value = response.json()
-        .context("Failed to parse wordpress.org API response")?;
+    let body: serde_json::Value = response
+        .json()
+        .context("Failed to parse response from wordpress.org API")?;
 
     if body.get("error").is_some() {
         bail!(
-            "Plugin '{}' not found on wordpress.org",
+            "Plugin '{}' not found on wordpress.org. \
+             Check the slug matches the plugin's directory name.",
             slug
         );
     }
