@@ -714,6 +714,81 @@ mod tests {
         assert_eq!(filtered.files[0].path, "src/a.php");
     }
 
+    #[test]
+    fn apply_exclude_trailing_slash() {
+        let result = make_test_result(vec![
+            (
+                "assets/js/app.js",
+                FileCategory::Source,
+                FileStatus::Modified,
+            ),
+            (
+                "includes/foo.php",
+                FileCategory::Source,
+                FileStatus::Modified,
+            ),
+        ]);
+
+        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata]
+            .into_iter()
+            .collect();
+        let filtered = result.apply(&all_cats, &["assets/".to_string()]);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "includes/foo.php");
+    }
+
+    #[test]
+    fn apply_exclude_nested_dir() {
+        let result = make_test_result(vec![
+            ("a/b/c.php", FileCategory::Source, FileStatus::Modified),
+            ("a/d.php", FileCategory::Source, FileStatus::Modified),
+            ("e.php", FileCategory::Source, FileStatus::Modified),
+        ]);
+
+        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
+        let filtered = result.apply(&all_cats, &["a".to_string()]);
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "e.php");
+    }
+
+    #[test]
+    fn apply_empty_exclude() {
+        let result = make_test_result(vec![
+            ("a.php", FileCategory::Source, FileStatus::Modified),
+            ("b.php", FileCategory::Source, FileStatus::Modified),
+        ]);
+
+        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
+        let filtered = result.apply(&all_cats, &[]);
+        assert_eq!(filtered.files.len(), 2);
+    }
+
+    #[test]
+    fn apply_recalculates_summary() {
+        let result = make_test_result(vec![
+            ("a.php", FileCategory::Source, FileStatus::Added),
+            ("b.php", FileCategory::Source, FileStatus::Modified),
+            ("c.min.js", FileCategory::Artifact, FileStatus::Modified),
+        ]);
+
+        let source_only: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
+        let filtered = result.apply(&source_only, &[]);
+        assert_eq!(filtered.summary.added, 1);
+        assert_eq!(filtered.summary.modified, 1);
+        assert_eq!(filtered.files.len(), 2);
+    }
+
+    #[test]
+    fn latest_version_preserved_through_filter() {
+        let mut result =
+            make_test_result(vec![("a.php", FileCategory::Source, FileStatus::Modified)]);
+        result.latest_version = Some("2.0".to_string());
+
+        let cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
+        let filtered = result.apply(&cats, &[]);
+        assert_eq!(filtered.latest_version, Some("2.0".to_string()));
+    }
+
     fn make_test_result(files: Vec<(&str, FileCategory, FileStatus)>) -> DiffResult {
         DiffResult {
             plugin_slug: "test".to_string(),

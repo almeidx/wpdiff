@@ -6,11 +6,12 @@ Rust CLI tool that diffs WordPress plugins against their upstream versions from 
 
 ```
 src/
-  main.rs      CLI entry point, subcommand dispatch, upgrade logic
+  main.rs      CLI entry point, subcommand dispatch, diff/summary/export/versions commands
+  upgrade.rs   Upgrade command: patch capture, apply, interactive conflict resolution
   plugin.rs    WP plugin header parsing, directory discovery
   source.rs    Source adapter trait, wordpress.org fetcher, version API
   diff.rs      Directory diff engine, file categorization, filtering
-  output.rs    Terminal, JSON, unified diff, summary renderers
+  output.rs    Terminal, JSON, unified diff, summary/table renderers
   progress.rs  Progress bar/spinner helpers with parallel suppression
 ```
 
@@ -19,7 +20,8 @@ src/
 - **Source adapter pattern**: `source::Source` trait allows adding new upstream sources (GitHub, GitLab) by implementing `fetch()`. Only wordpress.org is built in.
 - **Category filtering**: files are categorized as source/artifact/asset/metadata. Default output hides artifacts and assets. Filtering happens post-diff via `DiffResult::apply()`.
 - **Skipped directories**: `node_modules/`, `vendor/`, `external/`, `.git/`, `.svn/`, `.hg/` are pruned during directory walking (never traversed), but reported in output.
-- **Upgrade flow**: everything happens in a temp staging dir. The live plugin is only replaced after user confirmation. Backup zip is created before swap.
+- **Upgrade flow**: everything happens in a temp staging dir. The live plugin is only replaced after user confirmation. Backup zip is created before swap. Fuzzy-matched hunks trigger interactive per-section conflict resolution.
+- **Parallel processing**: `--all` mode uses rayon to diff plugins concurrently, with a separate parallel phase for version lookups. Progress bars are suppressed during parallel work.
 
 ## Building
 
@@ -43,6 +45,8 @@ cargo test
 - Error messages should be actionable — tell the user what to do, not just what went wrong.
 - Progress bars are suppressed in parallel mode via `progress::suppress()`.
 - All temp directories use `tempfile::TempDir` for automatic cleanup.
+- Pedantic clippy is enabled (`clippy::pedantic` + `clippy::nursery`). All code must pass `cargo clippy -- -D warnings`.
+- All code must be formatted with `cargo fmt`.
 
 ## Dependencies
 
@@ -64,3 +68,4 @@ cargo test
 | glob-match | File path glob matching |
 | mpatch | Patch application with fuzz matching |
 | rayon | Parallel plugin processing |
+| inquire | Interactive terminal prompts for conflict resolution |
