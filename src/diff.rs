@@ -12,6 +12,8 @@ use walkdir::WalkDir;
 pub struct DiffResult {
     pub plugin_slug: String,
     pub plugin_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
     pub files: Vec<FileDiff>,
     pub skipped_dirs: SkippedDirs,
     pub summary: DiffSummary,
@@ -42,6 +44,7 @@ impl DiffResult {
         Self {
             plugin_slug: self.plugin_slug.clone(),
             plugin_version: self.plugin_version.clone(),
+            latest_version: self.latest_version.clone(),
             files,
             skipped_dirs: self.skipped_dirs.clone(),
             summary: DiffSummary {
@@ -312,6 +315,7 @@ pub fn diff_directories(
     Ok(DiffResult {
         plugin_slug: slug.to_string(),
         plugin_version: version.to_string(),
+        latest_version: None,
         files,
         skipped_dirs,
         summary: DiffSummary {
@@ -713,6 +717,7 @@ mod tests {
     fn make_test_result(files: Vec<(&str, FileCategory, FileStatus)>) -> DiffResult {
         DiffResult {
             plugin_slug: "test".to_string(),
+            latest_version: None,
             plugin_version: "1.0".to_string(),
             files: files
                 .into_iter()

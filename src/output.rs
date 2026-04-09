@@ -2,11 +2,40 @@ use crate::diff::{DiffResult, FileCategory, FileDiff, FileStatus};
 use colored::Colorize;
 use std::io::Write;
 
+pub fn format_version_hint(result: &DiffResult) -> String {
+    match &result.latest_version {
+        Some(lv) if lv != &result.plugin_version => {
+            format!(" (latest: {})", format!("v{lv}").green())
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn write_colored_diff(
+    out: &mut impl Write,
+    diff_text: &str,
+    indent: &str,
+) -> anyhow::Result<()> {
+    for line in diff_text.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            writeln!(out, "{indent}{}", line.green())?;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            writeln!(out, "{indent}{}", line.red())?;
+        } else if line.starts_with("@@") {
+            writeln!(out, "{indent}{}", line.cyan())?;
+        } else {
+            writeln!(out, "{indent}{line}")?;
+        }
+    }
+    Ok(())
+}
+
 pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {
     writeln!(
         out,
-        "{}",
-        format!("wpdiff: {} v{}", result.plugin_slug, result.plugin_version).bold()
+        "{}{}",
+        format!("wpdiff: {} v{}", result.plugin_slug, result.plugin_version).bold(),
+        format_version_hint(result),
     )?;
     writeln!(
         out,
@@ -57,17 +86,7 @@ pub fn render_terminal(result: &DiffResult, out: &mut impl Write) -> anyhow::Res
         }
 
         writeln!(out, "{}", format!("diff {}", file.path).bold())?;
-        for line in file.diff_text.lines() {
-            if line.starts_with('+') && !line.starts_with("+++") {
-                writeln!(out, "{}", line.green())?;
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                writeln!(out, "{}", line.red())?;
-            } else if line.starts_with("@@") {
-                writeln!(out, "{}", line.cyan())?;
-            } else {
-                writeln!(out, "{line}")?;
-            }
-        }
+        write_colored_diff(out, &file.diff_text, "")?;
         writeln!(out)?;
     }
 
@@ -197,26 +216,66 @@ pub fn render_summary_table(
         .unwrap_or(3)
         .max(3);
 
-    let cw = [6, 6, 5, 8, 8]; // column widths: Added, Rm'd, Mod, Ins(+), Del(-)
+    let any_outdated = results.iter().any(|r| {
+        r.latest_version
+            .as_ref()
+            .is_some_and(|lv| lv != &r.plugin_version)
+    });
+    let max_latest = if any_outdated {
+        results
+            .iter()
+            .filter_map(|r| r.latest_version.as_ref())
+            .map(|v| v.len() + 1)
+            .max()
+            .unwrap_or(0)
+            .max(6)
+    } else {
+        0
+    };
 
-    writeln!(
-        out,
-        " {:<name_w$}  {:<ver_w$}  {:>cw0$}  {:>cw1$}  {:>cw2$}  {:>cw3$}  {:>cw4$}",
-        "Plugin".bold().underline(),
-        "Ver".bold().underline(),
-        "Added".bold().underline(),
-        "Rm'd".bold().underline(),
-        "Mod".bold().underline(),
-        "Ins(+)".bold().underline(),
-        "Del(-)".bold().underline(),
-        name_w = max_name,
-        ver_w = max_ver,
-        cw0 = cw[0],
-        cw1 = cw[1],
-        cw2 = cw[2],
-        cw3 = cw[3],
-        cw4 = cw[4],
-    )?;
+    let cw = [6, 6, 5, 8, 8];
+
+    if any_outdated {
+        writeln!(
+            out,
+            " {:<name_w$}  {:<ver_w$}  {:<lat_w$}  {:>cw0$}  {:>cw1$}  {:>cw2$}  {:>cw3$}  {:>cw4$}",
+            "Plugin".bold().underline(),
+            "Ver".bold().underline(),
+            "Latest".bold().underline(),
+            "Added".bold().underline(),
+            "Rm'd".bold().underline(),
+            "Mod".bold().underline(),
+            "Ins(+)".bold().underline(),
+            "Del(-)".bold().underline(),
+            name_w = max_name,
+            ver_w = max_ver,
+            lat_w = max_latest,
+            cw0 = cw[0],
+            cw1 = cw[1],
+            cw2 = cw[2],
+            cw3 = cw[3],
+            cw4 = cw[4],
+        )?;
+    } else {
+        writeln!(
+            out,
+            " {:<name_w$}  {:<ver_w$}  {:>cw0$}  {:>cw1$}  {:>cw2$}  {:>cw3$}  {:>cw4$}",
+            "Plugin".bold().underline(),
+            "Ver".bold().underline(),
+            "Added".bold().underline(),
+            "Rm'd".bold().underline(),
+            "Mod".bold().underline(),
+            "Ins(+)".bold().underline(),
+            "Del(-)".bold().underline(),
+            name_w = max_name,
+            ver_w = max_ver,
+            cw0 = cw[0],
+            cw1 = cw[1],
+            cw2 = cw[2],
+            cw3 = cw[3],
+            cw4 = cw[4],
+        )?;
+    }
 
     let mut total_added = 0;
     let mut total_removed = 0;
@@ -234,11 +293,24 @@ pub fn render_summary_table(
         total_ins += ins;
         total_del += del;
 
+        let latest_col = if any_outdated {
+            let s = match &result.latest_version {
+                Some(lv) if lv != &result.plugin_version => {
+                    format!("{:<lat_w$}", format!("v{lv}").green(), lat_w = max_latest)
+                }
+                _ => format!("{:<lat_w$}", "✓".dimmed(), lat_w = max_latest),
+            };
+            format!("  {s}")
+        } else {
+            String::new()
+        };
+
         writeln!(
             out,
-            " {:<name_w$}  {:<ver_w$}  {}  {}  {}  {}  {}",
+            " {:<name_w$}  {:<ver_w$}{}  {}  {}  {}  {}  {}",
             result.plugin_slug.bold(),
             format!("v{}", result.plugin_version).dimmed(),
+            latest_col,
             col_green(result.summary.added, cw[0], "+"),
             col_red(result.summary.removed, cw[1], "-"),
             col_yellow(result.summary.modified, cw[2]),
@@ -250,11 +322,26 @@ pub fn render_summary_table(
     }
 
     if results.len() > 1 {
+        let latest_spacer = if any_outdated {
+            format!(
+                "  {:<lat_w$}",
+                "─".repeat(max_latest).dimmed(),
+                lat_w = max_latest
+            )
+        } else {
+            String::new()
+        };
+        let latest_spacer_empty = if any_outdated {
+            format!("  {:<lat_w$}", "", lat_w = max_latest)
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            " {:<name_w$}  {:<ver_w$}  {}  {}  {}  {}  {}",
+            " {:<name_w$}  {:<ver_w$}{}  {}  {}  {}  {}  {}",
             "".dimmed(),
             "".dimmed(),
+            latest_spacer,
             "─".repeat(cw[0]).dimmed(),
             "─".repeat(cw[1]).dimmed(),
             "─".repeat(cw[2]).dimmed(),
@@ -265,9 +352,10 @@ pub fn render_summary_table(
         )?;
         writeln!(
             out,
-            " {:<name_w$}  {:<ver_w$}  {}  {}  {}  {}  {}",
+            " {:<name_w$}  {:<ver_w$}{}  {}  {}  {}  {}  {}",
             "Total".bold(),
             "",
+            latest_spacer_empty,
             col_green(total_added, cw[0], "+"),
             col_red(total_removed, cw[1], "-"),
             col_yellow(total_modified, cw[2]),
@@ -303,8 +391,9 @@ fn term_width() -> usize {
 pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Result<()> {
     writeln!(
         out,
-        "{}",
-        format!("wpdiff: {} v{}", result.plugin_slug, result.plugin_version).bold()
+        "{}{}",
+        format!("wpdiff: {} v{}", result.plugin_slug, result.plugin_version).bold(),
+        format_version_hint(result),
     )?;
 
     render_skipped_dirs(result, out)?;
