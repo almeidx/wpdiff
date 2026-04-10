@@ -308,4 +308,58 @@ mod tests {
         let nonexistent = dir.path().join("does-not-exist");
         assert!(find_plugins_dir(&nonexistent).is_err());
     }
+
+    #[test]
+    fn discover_all_finds_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("wp-content/plugins");
+        let p1 = plugins.join("akismet");
+        let p2 = plugins.join("hello-dolly");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(
+            p1.join("akismet.php"),
+            "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
+        )
+        .unwrap();
+        fs::write(
+            p2.join("hello.php"),
+            "<?php\n/*\nPlugin Name: Hello Dolly\nVersion: 1.7\n*/\n",
+        )
+        .unwrap();
+
+        let results = discover_all(dir.path()).unwrap();
+        let slugs: Vec<String> = results
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|m| m.slug)
+            .collect();
+
+        assert_eq!(slugs.len(), 2);
+        assert!(slugs.contains(&"akismet".to_string()));
+        assert!(slugs.contains(&"hello-dolly".to_string()));
+    }
+
+    #[test]
+    fn discover_all_skips_non_plugin_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("wp-content/plugins");
+        let p1 = plugins.join("akismet");
+        let p2 = plugins.join("not-a-plugin");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(
+            p1.join("akismet.php"),
+            "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
+        )
+        .unwrap();
+        fs::write(p2.join("readme.txt"), "not a plugin").unwrap();
+
+        let results = discover_all(dir.path()).unwrap();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let err_count = results.iter().filter(|r| r.is_err()).count();
+
+        assert_eq!(ok_count, 1);
+        assert_eq!(err_count, 1);
+    }
 }

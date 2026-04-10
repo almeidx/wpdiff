@@ -106,7 +106,11 @@ pub struct CategorySummary {
 }
 
 impl CategorySummary {
-    fn tally(map: &mut BTreeMap<FileCategory, Self>, category: FileCategory, status: FileStatus) {
+    pub(crate) fn tally(
+        map: &mut BTreeMap<FileCategory, Self>,
+        category: FileCategory,
+        status: FileStatus,
+    ) {
         let entry = map.entry(category).or_default();
         match status {
             FileStatus::Added => entry.added += 1,
@@ -788,6 +792,191 @@ mod tests {
         let filtered = result.apply(&cats, &[]);
         assert_eq!(filtered.latest_version, Some("2.0".to_string()));
     }
+
+    // --- Filesystem-based tests ---
+
+    #[test]
+    fn diff_directories_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert!(result.files.is_empty());
+        assert_eq!(result.summary.unchanged, 1);
+    }
+
+    #[test]
+    fn diff_directories_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "modified\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "original\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert_eq!(result.summary.modified, 1);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].status, FileStatus::Modified);
+        assert!(result.files[0].insertions > 0);
+        assert!(result.files[0].deletions > 0);
+    }
+
+    #[test]
+    fn diff_directories_added_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello\n").unwrap();
+        std::fs::write(local.join("new.php"), "new file\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert_eq!(result.summary.added, 1);
+        assert_eq!(result.summary.unchanged, 1);
+        let added = result
+            .files
+            .iter()
+            .find(|f| f.status == FileStatus::Added)
+            .unwrap();
+        assert_eq!(added.path, "new.php");
+    }
+
+    #[test]
+    fn diff_directories_removed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+        std::fs::write(upstream.join("old.php"), "removed\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert_eq!(result.summary.removed, 1);
+        let removed = result
+            .files
+            .iter()
+            .find(|f| f.status == FileStatus::Removed)
+            .unwrap();
+        assert_eq!(removed.path, "old.php");
+    }
+
+    #[test]
+    fn diff_directories_skips_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(local.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello\n").unwrap();
+        std::fs::write(local.join("node_modules/pkg/index.js"), "junk\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert!(
+            result
+                .skipped_dirs
+                .local
+                .contains(&"node_modules".to_string())
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|f| !f.path.contains("node_modules"))
+        );
+    }
+
+    #[test]
+    fn diff_directories_whitespace_ignored_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello   \n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert_eq!(result.summary.unchanged, 1);
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn diff_directories_whitespace_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello   \n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", true).unwrap();
+        assert_eq!(result.summary.modified, 1);
+    }
+
+    #[test]
+    fn diff_directories_categorizes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("src.php"), "changed\n").unwrap();
+        std::fs::write(upstream.join("src.php"), "original\n").unwrap();
+        std::fs::write(local.join("app.min.js"), "changed\n").unwrap();
+        std::fs::write(upstream.join("app.min.js"), "original\n").unwrap();
+        std::fs::write(local.join("logo.png"), "changed\n").unwrap();
+        std::fs::write(upstream.join("logo.png"), "original\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert_eq!(result.summary.modified, 3);
+
+        let src = result.files.iter().find(|f| f.path == "src.php").unwrap();
+        assert_eq!(src.category, FileCategory::Source);
+
+        let min = result
+            .files
+            .iter()
+            .find(|f| f.path == "app.min.js")
+            .unwrap();
+        assert_eq!(min.category, FileCategory::Artifact);
+
+        let png = result.files.iter().find(|f| f.path == "logo.png").unwrap();
+        assert_eq!(png.category, FileCategory::Asset);
+    }
+
+    #[test]
+    fn diff_directories_skips_vendor_and_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(local.join("vendor/lib")).unwrap();
+        std::fs::create_dir_all(local.join("external/pkg")).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(local.join("a.php"), "hello\n").unwrap();
+        std::fs::write(local.join("vendor/lib/x.php"), "vendor\n").unwrap();
+        std::fs::write(local.join("external/pkg/y.php"), "ext\n").unwrap();
+        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+
+        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
+        assert!(result.skipped_dirs.local.contains(&"vendor".to_string()));
+        assert!(result.skipped_dirs.local.contains(&"external".to_string()));
+        assert!(result.files.iter().all(|f| !f.path.contains("vendor")));
+    }
+
+    // --- Helpers ---
 
     fn make_test_result(files: Vec<(&str, FileCategory, FileStatus)>) -> DiffResult {
         DiffResult {

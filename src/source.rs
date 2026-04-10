@@ -277,10 +277,7 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
     let mut keyed: Vec<(Vec<u64>, String)> = versions
         .into_iter()
         .map(|v| {
-            let key: Vec<u64> = v
-                .split(['.', '-'])
-                .filter_map(|part| part.parse().ok())
-                .collect();
+            let key = version_sort_key(&v);
             (key, v)
         })
         .collect();
@@ -292,6 +289,13 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         latest_version,
         versions,
     })
+}
+
+fn version_sort_key(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-'])
+        .filter_map(|part| part.parse().ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -321,5 +325,77 @@ mod tests {
     #[test]
     fn strip_top_dir_empty() {
         assert_eq!(strip_top_dir(""), "");
+    }
+
+    #[test]
+    fn version_sort_key_simple() {
+        assert_eq!(version_sort_key("1.2.3"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn version_sort_key_with_prerelease() {
+        assert_eq!(version_sort_key("2.0.0-beta.1"), vec![2, 0, 0, 1]);
+    }
+
+    #[test]
+    fn version_sort_key_strips_non_numeric() {
+        assert_eq!(version_sort_key("1.0.0-rc.2"), vec![1, 0, 0, 2]);
+    }
+
+    #[test]
+    fn version_sort_key_empty() {
+        assert_eq!(version_sort_key(""), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn version_sort_key_single() {
+        assert_eq!(version_sort_key("5"), vec![5]);
+    }
+
+    #[test]
+    fn version_sort_ordering() {
+        let versions = vec![
+            "1.10.0".to_string(),
+            "1.9.0".to_string(),
+            "2.0.0".to_string(),
+            "1.0.0".to_string(),
+        ];
+
+        let mut keyed: Vec<(Vec<u64>, String)> = versions
+            .into_iter()
+            .map(|v| {
+                let key = version_sort_key(&v);
+                (key, v)
+            })
+            .collect();
+        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let sorted: Vec<String> = keyed.into_iter().map(|(_, v)| v).collect();
+
+        assert_eq!(sorted, vec!["1.0.0", "1.9.0", "1.10.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn version_sort_with_prereleases() {
+        let versions = vec![
+            "2.0.0".to_string(),
+            "2.0.0-beta.1".to_string(),
+            "1.9.0".to_string(),
+            "2.0.0-rc.1".to_string(),
+        ];
+
+        let mut keyed: Vec<(Vec<u64>, String)> = versions
+            .into_iter()
+            .map(|v| {
+                let key = version_sort_key(&v);
+                (key, v)
+            })
+            .collect();
+        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let sorted: Vec<String> = keyed.into_iter().map(|(_, v)| v).collect();
+
+        assert_eq!(sorted[0], "1.9.0");
+        assert_eq!(sorted[1], "2.0.0");
+        assert!(sorted.contains(&"2.0.0-beta.1".to_string()));
+        assert!(sorted.contains(&"2.0.0-rc.1".to_string()));
     }
 }

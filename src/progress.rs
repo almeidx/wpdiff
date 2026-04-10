@@ -35,3 +35,32 @@ pub fn spinner(template: &str) -> ProgressBar {
     pb.enable_steady_tick(Duration::from_millis(100));
     pb
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppress_returns_hidden_bar() {
+        suppress(true);
+        let pb = bar(100, "{pos}/{len}");
+        assert!(pb.is_hidden());
+        suppress(false);
+    }
+
+    #[test]
+    fn suppress_returns_hidden_spinner() {
+        suppress(true);
+        let pb = spinner("{spinner} working...");
+        assert!(pb.is_hidden());
+        suppress(false);
+    }
+
+    #[test]
+    fn suppress_toggle() {
+        suppress(true);
+        assert!(is_suppressed());
+        suppress(false);
+        assert!(!is_suppressed());
+    }
+}

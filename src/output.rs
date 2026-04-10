@@ -483,3 +483,406 @@ pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Resu
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{DiffSummary, SkippedDirs};
+    use std::collections::BTreeMap;
+
+    fn make_result(
+        slug: &str,
+        version: &str,
+        latest: Option<&str>,
+        files: Vec<FileDiff>,
+        skipped_local: Vec<&str>,
+        skipped_upstream: Vec<&str>,
+    ) -> DiffResult {
+        let mut added = 0;
+        let mut removed = 0;
+        let mut modified = 0;
+        let mut by_category = BTreeMap::new();
+
+        for f in &files {
+            crate::diff::CategorySummary::tally(&mut by_category, f.category, f.status);
+            match f.status {
+                FileStatus::Added => added += 1,
+                FileStatus::Removed => removed += 1,
+                FileStatus::Modified => modified += 1,
+            }
+        }
+
+        DiffResult {
+            plugin_slug: slug.to_string(),
+            plugin_version: version.to_string(),
+            latest_version: latest.map(String::from),
+            files,
+            skipped_dirs: SkippedDirs {
+                local: skipped_local.into_iter().map(String::from).collect(),
+                upstream: skipped_upstream.into_iter().map(String::from).collect(),
+            },
+            summary: DiffSummary {
+                added,
+                removed,
+                modified,
+                unchanged: 5,
+                by_category,
+            },
+        }
+    }
+
+    fn make_file(
+        path: &str,
+        status: FileStatus,
+        cat: FileCategory,
+        ins: usize,
+        del: usize,
+    ) -> FileDiff {
+        FileDiff {
+            path: path.to_string(),
+            status,
+            category: cat,
+            insertions: ins,
+            deletions: del,
+            diff_text: if ins > 0 || del > 0 {
+                format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n")
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn output_to_string(f: impl FnOnce(&mut Vec<u8>) -> anyhow::Result<()>) -> String {
+        colored::control::set_override(false);
+        let mut buf = Vec::new();
+        f(&mut buf).unwrap();
+        colored::control::unset_override();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn version_hint_when_outdated() {
+        colored::control::set_override(false);
+        let result = make_result("test", "1.0", Some("2.0"), vec![], vec![], vec![]);
+        let hint = format_version_hint(&result);
+        colored::control::unset_override();
+        assert!(hint.contains("v2.0"));
+        assert!(hint.contains("latest"));
+    }
+
+    #[test]
+    fn version_hint_when_current() {
+        let result = make_result("test", "1.0", Some("1.0"), vec![], vec![], vec![]);
+        assert!(format_version_hint(&result).is_empty());
+    }
+
+    #[test]
+    fn version_hint_when_none() {
+        let result = make_result("test", "1.0", None, vec![], vec![], vec![]);
+        assert!(format_version_hint(&result).is_empty());
+    }
+
+    #[test]
+    fn colored_diff_classifies_lines() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n context\n";
+        let out = output_to_string(|buf| write_colored_diff(buf, diff, ""));
+        assert!(out.contains("-old"));
+        assert!(out.contains("+new"));
+        assert!(out.contains("@@ -1 +1 @@"));
+        assert!(out.contains(" context"));
+    }
+
+    #[test]
+    fn colored_diff_with_indent() {
+        let diff = "+added\n";
+        let out = output_to_string(|buf| write_colored_diff(buf, diff, ">>"));
+        assert!(out.starts_with(">>"));
+    }
+
+    #[test]
+    fn terminal_no_diffs() {
+        let result = make_result("akismet", "5.0", None, vec![], vec![], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("akismet"));
+        assert!(out.contains("v5.0"));
+        assert!(out.contains("No differences found"));
+    }
+
+    #[test]
+    fn terminal_with_files() {
+        let files = vec![make_file(
+            "a.php",
+            FileStatus::Modified,
+            FileCategory::Source,
+            3,
+            1,
+        )];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("a.php"));
+        assert!(out.contains("Source Files"));
+        assert!(out.contains("diff a.php"));
+    }
+
+    #[test]
+    fn terminal_groups_by_category() {
+        let files = vec![
+            make_file("src.php", FileStatus::Modified, FileCategory::Source, 1, 1),
+            make_file(
+                "app.min.js",
+                FileStatus::Modified,
+                FileCategory::Artifact,
+                1,
+                1,
+            ),
+        ];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("Source Files"));
+        assert!(out.contains("Build Artifacts"));
+    }
+
+    #[test]
+    fn terminal_shows_skipped_dirs() {
+        let result = make_result("test", "1.0", None, vec![], vec!["node_modules"], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("Skipped Directories"));
+        assert!(out.contains("node_modules"));
+    }
+
+    #[test]
+    fn unified_outputs_raw_diff() {
+        let files = vec![make_file(
+            "a.php",
+            FileStatus::Modified,
+            FileCategory::Source,
+            1,
+            1,
+        )];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_unified(&result, buf));
+        assert!(out.contains("--- a/a.php"));
+        assert!(out.contains("+++ b/a.php"));
+    }
+
+    #[test]
+    fn unified_skips_empty_diffs() {
+        let files = vec![FileDiff {
+            path: "empty.php".to_string(),
+            status: FileStatus::Modified,
+            category: FileCategory::Source,
+            insertions: 0,
+            deletions: 0,
+            diff_text: String::new(),
+        }];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_unified(&result, buf));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn json_is_valid() {
+        let files = vec![make_file(
+            "a.php",
+            FileStatus::Modified,
+            FileCategory::Source,
+            1,
+            1,
+        )];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_json(&result, buf));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["plugin_slug"], "test");
+        assert!(parsed["files"].is_array());
+    }
+
+    #[test]
+    fn json_includes_latest_version() {
+        let result = make_result("test", "1.0", Some("2.0"), vec![], vec![], vec![]);
+        let out = output_to_string(|buf| render_json(&result, buf));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["latest_version"], "2.0");
+    }
+
+    #[test]
+    fn json_omits_latest_when_none() {
+        let result = make_result("test", "1.0", None, vec![], vec![], vec![]);
+        let out = output_to_string(|buf| render_json(&result, buf));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed.get("latest_version").is_none());
+    }
+
+    #[test]
+    fn summary_no_diffs() {
+        let result = make_result("akismet", "5.0", None, vec![], vec![], vec![]);
+        let out = output_to_string(|buf| render_summary(&result, buf));
+        assert!(out.contains("akismet"));
+        assert!(out.contains("No differences found"));
+    }
+
+    #[test]
+    fn summary_shows_diffstat() {
+        let files = vec![
+            make_file("a.php", FileStatus::Modified, FileCategory::Source, 10, 5),
+            make_file("b.php", FileStatus::Added, FileCategory::Source, 20, 0),
+        ];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_summary(&result, buf));
+        assert!(out.contains("a.php"));
+        assert!(out.contains("b.php"));
+        assert!(out.contains("files changed"));
+        assert!(out.contains("insertions"));
+        assert!(out.contains("deletions"));
+    }
+
+    #[test]
+    fn summary_shows_unchanged_count() {
+        let files = vec![make_file(
+            "a.php",
+            FileStatus::Modified,
+            FileCategory::Source,
+            1,
+            1,
+        )];
+        let result = make_result("test", "1.0", None, files, vec![], vec![]);
+        let out = output_to_string(|buf| render_summary(&result, buf));
+        assert!(out.contains("5 files unchanged"));
+    }
+
+    #[test]
+    fn summary_table_single() {
+        let files = vec![make_file(
+            "a.php",
+            FileStatus::Modified,
+            FileCategory::Source,
+            5,
+            3,
+        )];
+        let result = make_result("akismet", "5.0", None, files, vec![], vec![]);
+        let out =
+            output_to_string(|buf| render_summary_table(std::slice::from_ref(&result), 0, 0, buf));
+        assert!(out.contains("akismet"));
+        assert!(out.contains("v5.0"));
+        assert!(out.contains("plugins scanned"));
+    }
+
+    #[test]
+    fn summary_table_multiple_with_totals() {
+        let r1 = make_result(
+            "akismet",
+            "5.0",
+            None,
+            vec![make_file(
+                "a.php",
+                FileStatus::Modified,
+                FileCategory::Source,
+                5,
+                3,
+            )],
+            vec![],
+            vec![],
+        );
+        let r2 = make_result(
+            "woo",
+            "10.0",
+            None,
+            vec![make_file(
+                "b.php",
+                FileStatus::Added,
+                FileCategory::Source,
+                10,
+                0,
+            )],
+            vec![],
+            vec![],
+        );
+        let results = vec![r1, r2];
+        let out = output_to_string(|buf| render_summary_table(&results, 3, 1, buf));
+        assert!(out.contains("Total"));
+        assert!(out.contains("6 plugins scanned"));
+        assert!(out.contains("2 changed"));
+        assert!(out.contains("3 unchanged"));
+        assert!(out.contains("1 unmatched"));
+    }
+
+    #[test]
+    fn summary_table_shows_latest_column() {
+        let r1 = make_result(
+            "akismet",
+            "5.0",
+            Some("5.5"),
+            vec![make_file(
+                "a.php",
+                FileStatus::Modified,
+                FileCategory::Source,
+                1,
+                1,
+            )],
+            vec![],
+            vec![],
+        );
+        let out =
+            output_to_string(|buf| render_summary_table(std::slice::from_ref(&r1), 0, 0, buf));
+        assert!(out.contains("Latest"));
+        assert!(out.contains("v5.5"));
+    }
+
+    #[test]
+    fn summary_table_hides_latest_when_current() {
+        let r1 = make_result(
+            "akismet",
+            "5.0",
+            Some("5.0"),
+            vec![make_file(
+                "a.php",
+                FileStatus::Modified,
+                FileCategory::Source,
+                1,
+                1,
+            )],
+            vec![],
+            vec![],
+        );
+        let out =
+            output_to_string(|buf| render_summary_table(std::slice::from_ref(&r1), 0, 0, buf));
+        assert!(!out.contains("Latest"));
+    }
+
+    #[test]
+    fn summary_table_empty() {
+        let out = output_to_string(|buf| render_summary_table(&[], 0, 0, buf));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn skipped_dirs_both_sides() {
+        let result = make_result("test", "1.0", None, vec![], vec!["vendor"], vec!["vendor"]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("vendor/"));
+        assert!(!out.contains("local only"));
+        assert!(!out.contains("upstream only"));
+    }
+
+    #[test]
+    fn skipped_dirs_local_only() {
+        let result = make_result("test", "1.0", None, vec![], vec!["node_modules"], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("node_modules/"));
+        assert!(out.contains("local only"));
+    }
+
+    #[test]
+    fn skipped_dirs_upstream_only() {
+        let result = make_result("test", "1.0", None, vec![], vec![], vec!["vendor"]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(out.contains("vendor/"));
+        assert!(out.contains("upstream only"));
+    }
+
+    #[test]
+    fn skipped_dirs_none_shown() {
+        let result = make_result("test", "1.0", None, vec![], vec![], vec![]);
+        let out = output_to_string(|buf| render_terminal(&result, buf));
+        assert!(!out.contains("Skipped Directories"));
+    }
+}
