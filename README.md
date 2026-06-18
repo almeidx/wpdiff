@@ -1,113 +1,121 @@
 # wpdiff
 
-Diff locally installed WordPress plugins against their official upstream versions. Find what changed, export patches, and upgrade plugins while preserving your customizations.
+Diff locally installed WordPress plugins against their official upstream
+versions.
+
+wpdiff is a single-binary CLI for finding local plugin customizations, exporting
+patches, and upgrading plugins while preserving the changes you made on disk.
+It compares your installed plugin tree with the matching package from
+wordpress.org and keeps destructive work inside the explicit `upgrade` flow.
+
+```sh
+wpdiff akismet
+wpdiff summary --all -C /var/www/html
+wpdiff export akismet -o customizations.patch
+wpdiff upgrade akismet --dry-run -C /var/www/html
+```
 
 ## Install
 
-Download the latest binary from [releases](https://github.com/cyph/wpdiff/releases), or build from source:
+From crates.io:
 
-```bash
-cargo install --path .
+```sh
+cargo install wpdiff
 ```
+
+Or download a static Linux binary (`x86_64` / `aarch64`) from
+[GitHub Releases](https://github.com/almeidx/wpdiff/releases). Verify with the
+published SHA-256 checksums.
+
+## Quick start
+
+Run from the WordPress root, or pass `-C` to point at it:
+
+```sh
+wpdiff akismet
+wpdiff akismet -C /var/www/html
+wpdiff /var/www/html/wp-content/plugins/akismet
+```
+
+By default wpdiff shows a colored unified diff of source and metadata changes
+between the local plugin and the upstream version on wordpress.org.
 
 ## Usage
 
-### Diff a plugin
+Summarize one plugin or every plugin in an installation:
 
-```bash
-wpdiff akismet                          # from within a WordPress directory
-wpdiff akismet -C /var/www/html         # specify WordPress root
-wpdiff /path/to/wp-content/plugins/akismet  # explicit path
+```sh
+wpdiff summary akismet
+wpdiff summary --all -C /var/www/html
 ```
 
-Shows a colored unified diff of local changes vs the upstream version on wordpress.org.
+Export local customizations as a patch:
 
-### Summary
-
-```bash
-wpdiff summary akismet                  # git-style diffstat for one plugin
-wpdiff summary --all -C /var/www/html   # table of all modified plugins
+```sh
+wpdiff export akismet
+wpdiff export akismet -o my.patch
 ```
 
-### Export a patch
+List upstream versions:
 
-```bash
-wpdiff export akismet                   # writes akismet-5.3.7.patch
-wpdiff export akismet -o my.patch       # custom output path
+```sh
+wpdiff versions akismet
+wpdiff versions akismet --json
 ```
 
-### List available versions
+Upgrade with patch reapply:
 
-```bash
-wpdiff versions akismet                 # shows recent versions with installed marker
-wpdiff versions akismet --json          # machine-readable output
+```sh
+wpdiff upgrade akismet -C /var/www/html
+wpdiff upgrade akismet --to 5.5 -C /var/www/html
+wpdiff upgrade akismet --dry-run -C /var/www/html
 ```
 
-### Upgrade with patch reapply
-
-```bash
-wpdiff upgrade akismet -C /var/www/html           # upgrade to latest, reapply customizations
-wpdiff upgrade akismet --to 5.5 -C /var/www/html  # upgrade to specific version
-wpdiff upgrade akismet --dry-run -C /var/www/html  # test without modifying anything
-```
-
-The upgrade command:
-1. Captures your local customizations as a patch
-2. Downloads the target version to a staging area
-3. Applies the patch using fuzzy matching
-4. Creates a zip backup of the current plugin
-5. Swaps in the upgraded version only after you confirm
-
-If some patch hunks fail, the tool saves a `.patch` file and `.rej` file for manual resolution.
+The upgrade command captures local customizations as a patch, downloads the
+target version to a staging directory, reapplies the patch with fuzzy matching,
+creates a backup zip of the current plugin, and swaps in the upgraded tree only
+after confirmation. If hunks fail, wpdiff writes patch/reject files for manual
+resolution.
 
 ## Filtering
 
-By default, only source code and metadata changes are shown. Build artifacts (`.min.js`, `vendor/`, etc.) and binary assets (images, fonts) are hidden.
+Default output hides generated artifacts (`.min.js`, `vendor/`, etc.) and
+binary assets (images, fonts). Include more when you need it:
 
-```bash
-wpdiff akismet --include-artifacts      # also show build artifacts
-wpdiff akismet --include-assets         # also show binary assets
-wpdiff akismet --include-all            # show everything
-wpdiff akismet -x "assets/js/**"        # exclude specific paths
-wpdiff akismet -x assets -x templates   # exclude multiple paths
+```sh
+wpdiff akismet --include-artifacts
+wpdiff akismet --include-assets
+wpdiff akismet --include-all
+wpdiff akismet -x "assets/js/**"
+wpdiff akismet -x assets -x templates
 ```
 
-Directories like `node_modules/`, `vendor/`, `external/`, `.git/` are always skipped during file walking.
+Directories such as `node_modules/`, `vendor/`, `external/`, `.git/`, `.svn/`,
+and `.hg/` are always skipped during file walking.
 
-## All plugins
+## Output
 
-Scan every plugin in a WordPress installation:
-
-```bash
-wpdiff --all -C /var/www/html           # diff all plugins
-wpdiff summary --all -C /var/www/html   # summary table of all plugins
+```sh
+wpdiff akismet
+wpdiff akismet --json
+wpdiff summary akismet --json
 ```
 
-Plugins not found on wordpress.org are reported as unmatched.
+Terminal output is optimized for review. JSON output is intended for scripts and
+automation.
 
-## Output formats
+## Development
 
-```bash
-wpdiff akismet                          # colored terminal output (default)
-wpdiff akismet --json                   # JSON output
-wpdiff summary akismet --json           # JSON summary
+Requires a stable Rust toolchain with Rust 2024 support (Rust 1.85 or newer).
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-## Building
+CI runs the test suite and builds the static musl release targets. Merging a
+release PR publishes `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` binaries with SHA-256 checksums.
 
-Requires Rust 1.70+.
-
-```bash
-cargo build --release
-```
-
-Cross-compile for Linux (static musl binary):
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-## License
-
-MIT
+License: Apache-2.0.

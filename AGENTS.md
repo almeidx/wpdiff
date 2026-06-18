@@ -1,71 +1,60 @@
-# wpdiff
+# AGENTS.md
 
-Rust CLI tool that diffs WordPress plugins against their upstream versions from wordpress.org.
+wpdiff is a single-binary Rust CLI for comparing locally installed WordPress
+plugins with the official upstream packages from wordpress.org. It can show
+diffs, summarize changes, export patches, list upstream versions, and upgrade
+plugins while reapplying local customizations.
 
-## Architecture
+## The one rule that outranks everything
 
-```
-src/
-  main.rs      CLI entry point, subcommand dispatch, diff/summary/export/versions commands
-  upgrade.rs   Upgrade command: patch capture, apply, interactive conflict resolution
-  plugin.rs    WP plugin header parsing, directory discovery
-  source.rs    Source adapter trait, wordpress.org fetcher, version API
-  diff.rs      Directory diff engine, file categorization, filtering
-  output.rs    Terminal, JSON, unified diff, summary/table renderers
-  progress.rs  Progress bar/spinner helpers with parallel suppression
-```
+**Read-only commands must never mutate the WordPress installation, and upgrade
+must never replace a live plugin until the backup, patch application, and user
+confirmation paths have succeeded.** A failed download, fuzzy patch conflict,
+filesystem error, or declined prompt must leave the installed plugin exactly as
+it was.
 
-## Key design decisions
+Practical consequences:
+- `diff`, `summary`, `export`, and `versions` are inspection commands. They may
+  read the plugin tree and write only explicitly requested output files.
+- `upgrade --dry-run` exercises staging and patch reapply without touching the
+  live plugin directory.
+- The live plugin swap is the last step of `upgrade`, after a backup zip exists
+  and conflicts have either been resolved or surfaced for manual handling.
+- Temporary staging must use `tempfile::TempDir` so failed runs clean up after
+  themselves.
 
-- **Source adapter pattern**: `source::Source` trait allows adding new upstream sources (GitHub, GitLab) by implementing `fetch()`. Only wordpress.org is built in.
-- **Category filtering**: files are categorized as source/artifact/asset/metadata. Default output hides artifacts and assets. Filtering happens post-diff via `DiffResult::apply()`.
-- **Skipped directories**: `node_modules/`, `vendor/`, `external/`, `.git/`, `.svn/`, `.hg/` are pruned during directory walking (never traversed), but reported in output.
-- **Upgrade flow**: everything happens in a temp staging dir. The live plugin is only replaced after user confirmation. Backup zip is created before swap. Fuzzy-matched hunks trigger interactive per-section conflict resolution.
-- **Parallel processing**: `--all` mode uses rayon to diff plugins concurrently, with a separate parallel phase for version lookups. Progress bars are suppressed during parallel work.
+## Build / test / lint (CI runs exactly these)
 
-## Building
+    cargo test
+    cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
 
-```bash
-cargo build                                                    # dev build
-cargo build --release                                          # release build
-cargo build --release --target x86_64-unknown-linux-musl       # linux static binary
-```
-
-## Testing
-
-```bash
-cargo test
-```
+All three must pass before a change is considered done. CI also builds the
+static Linux release targets (`x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl`).
 
 ## Conventions
 
-- No comments that repeat what code does. Code should be self-documenting.
-- No commented-out code.
-- Prefer editing existing files over creating new ones.
-- Error messages should be actionable — tell the user what to do, not just what went wrong.
-- Progress bars are suppressed in parallel mode via `progress::suppress()`.
-- All temp directories use `tempfile::TempDir` for automatic cleanup.
-- Pedantic clippy is enabled (`clippy::pedantic` + `clippy::nursery`). All code must pass `cargo clippy -- -D warnings`.
-- All code must be formatted with `cargo fmt`.
+- Error messages should be actionable: tell the user what path, plugin slug,
+  version, or flag to fix.
+- Keep filesystem mutations explicit and late. Prefer staging directories and
+  atomic-ish swaps over in-place edits.
+- Progress bars are suppressed during parallel work with `progress::suppress()`.
+- Default diff output hides generated artifacts and binary assets; keep filtering
+  changes additive and predictable.
+- No comments that repeat what the code already says. Add comments only to
+  explain non-obvious safety or WordPress/package-format behavior.
 
-## Dependencies
+## Where things live
 
-| Crate | Purpose |
-|---|---|
-| clap | CLI argument parsing with derive |
-| similar | Unified diff generation |
-| colored | Terminal colors |
-| reqwest | HTTP client (blocking, rustls) |
-| zip | Zip archive reading/writing |
-| serde/serde_json | JSON serialization |
-| tempfile | Temp directories with auto-cleanup |
-| walkdir | Recursive directory traversal |
-| anyhow | Error handling |
-| regex | WP plugin header parsing |
-| log/env_logger | Logging |
-| indicatif | Progress bars and spinners |
-| terminal_size | Terminal width detection |
-| glob-match | File path glob matching |
-| mpatch | Patch application with fuzz matching |
-| rayon | Parallel plugin processing |
-| inquire | Interactive terminal prompts for conflict resolution |
+- `src/main.rs` — CLI definitions, subcommand dispatch, and top-level command
+  flow.
+- `src/plugin.rs` — WordPress plugin discovery and plugin-header parsing.
+- `src/source.rs` — upstream source abstraction and wordpress.org downloader /
+  version API.
+- `src/diff.rs` — directory diffing, file categorization, filtering, and skip
+  rules.
+- `src/output.rs` — terminal, JSON, unified diff, and summary/table renderers.
+- `src/upgrade.rs` — staging, backup, patch capture/reapply, conflict handling,
+  and final plugin replacement.
+- `src/progress.rs` — progress bar/spinner helpers and parallel suppression.
