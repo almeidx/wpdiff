@@ -17,13 +17,22 @@ wpdiff upgrade akismet --dry-run -C /var/www/html
 
 ## Install
 
+Preferred:
+
+```sh
+brew install almeidx/tap/wpdiff
+```
+
+This installs the prebuilt GitHub Release artifact for Apple Silicon macOS or
+Linux (`x86_64` / `aarch64`).
+
 From crates.io:
 
 ```sh
 cargo install wpdiff
 ```
 
-Or download a static Linux binary (`x86_64` / `aarch64`) from
+Or download a release archive directly from
 [GitHub Releases](https://github.com/almeidx/wpdiff/releases). Verify with the
 published SHA-256 checksums.
 
