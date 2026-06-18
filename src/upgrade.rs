@@ -454,8 +454,7 @@ fn resolve_file_hunks(
         let choice_idx = inquire::Select::new(&format!("  Section {}:", group_idx + 1), options)
             .with_starting_cursor(0)
             .raw_prompt()
-            .map(|o| o.index)
-            .unwrap_or(0);
+            .map_or(0, |o| o.index);
 
         match choice_idx {
             0 => {

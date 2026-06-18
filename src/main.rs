@@ -32,6 +32,20 @@ struct Cli {
     filter: FilterArgs,
 }
 
+impl Cli {
+    fn logging_args(&self) -> (u8, bool) {
+        match &self.command {
+            Some(Command::Summary { common, .. } | Command::Export { common, .. }) => (
+                common.verbose.max(self.common.verbose),
+                common.quiet || self.common.quiet,
+            ),
+            Some(Command::Versions { .. } | Command::Upgrade { .. }) | None => {
+                (self.common.verbose, self.common.quiet)
+            }
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Show a summary of changes (no diffs)
@@ -111,6 +125,29 @@ struct CommonArgs {
 }
 
 impl CommonArgs {
+    fn with_globals(&self, global: &Self) -> Self {
+        Self {
+            plugin: self.plugin.clone().or_else(|| global.plugin.clone()),
+            all: self.all || global.all,
+            dir: self.dir.clone().or_else(|| global.dir.clone()),
+            whitespace: self.whitespace || global.whitespace,
+            verbose: self.verbose.max(global.verbose),
+            quiet: self.quiet || global.quiet,
+        }
+    }
+
+    fn command_plugin<'a>(&'a self, plugin: Option<&'a str>) -> Option<&'a str> {
+        plugin.or(self.plugin.as_deref())
+    }
+
+    fn command_base_dir<'a>(&'a self, dir: Option<&'a str>) -> Option<&'a Path> {
+        dir.or(self.dir.as_deref()).map(Path::new)
+    }
+
+    const fn command_whitespace(&self, whitespace: bool) -> bool {
+        whitespace || self.whitespace
+    }
+
     fn base_dir(&self) -> Option<&Path> {
         self.dir.as_deref().map(Path::new)
     }
@@ -146,6 +183,19 @@ struct FilterArgs {
 }
 
 impl FilterArgs {
+    fn with_globals(&self, global: &Self) -> Self {
+        let mut exclude = global.exclude.clone();
+        exclude.extend(self.exclude.iter().cloned());
+
+        Self {
+            include_artifacts: self.include_artifacts || global.include_artifacts,
+            include_assets: self.include_assets || global.include_assets,
+            include_all: self.include_all || global.include_all,
+            exclude,
+            json: self.json || global.json,
+        }
+    }
+
     fn included_categories(&self) -> HashSet<FileCategory> {
         let mut cats = HashSet::new();
         cats.insert(FileCategory::Source);
@@ -169,15 +219,7 @@ impl FilterArgs {
 fn main() {
     let cli = Cli::parse();
 
-    let (verbose, quiet) = match &cli.command {
-        Some(Command::Summary { common, .. } | Command::Export { common, .. }) => {
-            (common.verbose, common.quiet)
-        }
-        Some(Command::Versions { .. } | Command::Upgrade { .. }) => {
-            (cli.common.verbose, cli.common.quiet)
-        }
-        None => (cli.common.verbose, cli.common.quiet),
-    };
+    let (verbose, quiet) = cli.logging_args();
 
     init_logger(verbose, quiet);
 
@@ -207,24 +249,38 @@ fn init_logger(verbose: u8, quiet: bool) {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Cli {
+        command,
+        common: global_common,
+        filter: global_filter,
+    } = cli;
+
+    match command {
         None => {
-            if cli.common.plugin.is_none() && !cli.common.all {
+            if global_common.plugin.is_none() && !global_common.all {
                 Cli::parse_from(["wpdiff", "--help"]);
                 return Ok(());
             }
-            render_command(&cli.common, &cli.filter, &RenderMode::Diff)
+            render_command(&global_common, &global_filter, &RenderMode::Diff)
         }
         Some(Command::Summary { common, filter }) => {
+            let common = common.with_globals(&global_common);
+            let filter = filter.with_globals(&global_filter);
             render_command(&common, &filter, &RenderMode::Summary)
         }
         Some(Command::Export {
             output,
             common,
             filter,
-        }) => cmd_export(&common, &filter, output.as_deref()),
+        }) => {
+            let common = common.with_globals(&global_common);
+            let filter = filter.with_globals(&global_filter);
+            cmd_export(&common, &filter, output.as_deref())
+        }
         Some(Command::Versions { plugin, dir, json }) => {
-            cmd_versions(plugin.as_deref(), dir.as_deref().map(Path::new), json)
+            let plugin = global_common.command_plugin(plugin.as_deref());
+            let base_dir = global_common.command_base_dir(dir.as_deref());
+            cmd_versions(plugin, base_dir, json || global_filter.json)
         }
         Some(Command::Upgrade {
             plugin,
@@ -234,12 +290,12 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             whitespace,
         }) => upgrade::run(
-            plugin.as_deref(),
-            dir.as_deref().map(Path::new),
+            global_common.command_plugin(plugin.as_deref()),
+            global_common.command_base_dir(dir.as_deref()),
             to.as_deref(),
             yes,
             dry_run,
-            whitespace,
+            global_common.command_whitespace(whitespace),
         ),
     }
 }
@@ -512,7 +568,7 @@ fn run_all(
     version_pb.finish_and_clear();
 
     let mut sorted: Vec<(String, Result<diff::DiffResult>)> = results;
-    sorted.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
+    sorted.sort_by_key(|(slug, _)| slug.to_lowercase());
 
     let mut diffs = Vec::new();
     let mut clean_count = 0usize;
@@ -569,4 +625,104 @@ fn run_all(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_uses_dir_before_subcommand() {
+        let cli =
+            Cli::try_parse_from(["wpdiff", "-C", "/tmp/wordpress", "summary", "--all"]).unwrap();
+        let Cli {
+            command,
+            common: global_common,
+            ..
+        } = cli;
+        let Some(Command::Summary { common, .. }) = command else {
+            panic!("expected summary command");
+        };
+        let common = common.with_globals(&global_common);
+
+        assert_eq!(common.dir.as_deref(), Some("/tmp/wordpress"));
+        assert!(common.all);
+    }
+
+    #[test]
+    fn versions_uses_dir_before_subcommand() {
+        let cli =
+            Cli::try_parse_from(["wpdiff", "-C", "/tmp/wordpress", "versions", "akismet"]).unwrap();
+        let Cli {
+            command,
+            common: global_common,
+            ..
+        } = cli;
+        let Some(Command::Versions { dir, .. }) = command else {
+            panic!("expected versions command");
+        };
+
+        assert_eq!(
+            global_common.command_base_dir(dir.as_deref()),
+            Some(Path::new("/tmp/wordpress"))
+        );
+    }
+
+    #[test]
+    fn versions_prefers_dir_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "wpdiff",
+            "-C",
+            "/tmp/global",
+            "versions",
+            "-C",
+            "/tmp/command",
+            "akismet",
+        ])
+        .unwrap();
+        let Cli {
+            command,
+            common: global_common,
+            ..
+        } = cli;
+        let Some(Command::Versions { dir, .. }) = command else {
+            panic!("expected versions command");
+        };
+
+        assert_eq!(
+            global_common.command_base_dir(dir.as_deref()),
+            Some(Path::new("/tmp/command"))
+        );
+    }
+
+    #[test]
+    fn upgrade_uses_whitespace_before_subcommand() {
+        let cli = Cli::try_parse_from([
+            "wpdiff",
+            "-C",
+            "/tmp/wordpress",
+            "--whitespace",
+            "upgrade",
+            "akismet",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Cli {
+            command,
+            common: global_common,
+            ..
+        } = cli;
+        let Some(Command::Upgrade {
+            dir, whitespace, ..
+        }) = command
+        else {
+            panic!("expected upgrade command");
+        };
+
+        assert_eq!(
+            global_common.command_base_dir(dir.as_deref()),
+            Some(Path::new("/tmp/wordpress"))
+        );
+        assert!(global_common.command_whitespace(whitespace));
+    }
 }

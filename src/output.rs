@@ -429,16 +429,17 @@ pub fn render_summary(result: &DiffResult, out: &mut impl Write) -> anyhow::Resu
 
     for file in &result.files {
         let total = file.insertions + file.deletions;
-        let bar_total = if max_changes > 0 {
-            (total * bar_width / max_changes).max(usize::from(total > 0))
-        } else {
-            0
-        };
-        let bar_ins = if total > 0 {
-            (file.insertions * bar_total / total).max(usize::from(file.insertions > 0))
-        } else {
-            0
-        };
+        let bar_total = total
+            .saturating_mul(bar_width)
+            .checked_div(max_changes)
+            .unwrap_or(0)
+            .max(usize::from(total > 0));
+        let bar_ins = file
+            .insertions
+            .saturating_mul(bar_total)
+            .checked_div(total)
+            .unwrap_or(0)
+            .max(usize::from(file.insertions > 0));
         let bar_del = bar_total.saturating_sub(bar_ins);
 
         let status_marker = match file.status {
