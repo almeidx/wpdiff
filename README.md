@@ -106,7 +106,7 @@ automation.
 
 ## Development
 
-Requires a stable Rust toolchain with Rust 2024 support (Rust 1.85 or newer).
+Requires a stable Rust toolchain with Rust 2024 support (Rust 1.96 or newer).
 
 ```sh
 cargo test

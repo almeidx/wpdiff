@@ -33,7 +33,7 @@ pub struct Registry {
 impl Registry {
     pub fn new() -> Self {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_mins(2))
             .build()
             .expect("failed to build HTTP client");
         let mut reg = Self {
