@@ -29,8 +29,8 @@ similar = { version = "3.1.1", features = ["text", "inline", "unicode"] }
 colored = "3.1.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "json"] }
 zip = "8.6.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tempfile = "3.27.0"
 walkdir = "2.5.0"
 anyhow = "1.0.104"
