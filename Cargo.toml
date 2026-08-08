@@ -24,8 +24,8 @@ cast_possible_truncation = "allow"
 case_sensitive_file_extension_comparisons = "allow"
 
 [dependencies]
-clap = { version = "4.6.4", features = ["derive"] }
-similar = { version = "3.1.1", features = ["text", "inline", "unicode"] }
+clap = { version = "4.6.6", features = ["derive"] }
+similar = { version = "3.1.2", features = ["text", "inline", "unicode"] }
 colored = "3.1.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "json"] }
 zip = "8.6.0"
