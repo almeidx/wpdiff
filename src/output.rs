@@ -574,13 +574,13 @@ mod tests {
     #[test]
     fn version_hint_when_current() {
         let result = make_result("test", "1.0", Some("1.0"), vec![], vec![], vec![]);
-        assert!(format_version_hint(&result).is_empty());
+        assert_eq!(format_version_hint(&result), "");
     }
 
     #[test]
     fn version_hint_when_none() {
         let result = make_result("test", "1.0", None, vec![], vec![], vec![]);
-        assert!(format_version_hint(&result).is_empty());
+        assert_eq!(format_version_hint(&result), "");
     }
 
     #[test]
@@ -678,7 +678,7 @@ mod tests {
         }];
         let result = make_result("test", "1.0", None, files, vec![], vec![]);
         let out = output_to_string(|buf| render_unified(&result, buf));
-        assert!(out.is_empty());
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn summary_table_empty() {
         let out = output_to_string(|buf| render_summary_table(&[], 0, 0, buf));
-        assert!(out.is_empty());
+        assert_eq!(out, "");
     }
 
     #[test]
