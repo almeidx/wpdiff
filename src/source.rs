@@ -172,7 +172,7 @@ fn download_and_extract(
 
     for i in 0..entry_count {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
 
         let rel_path = strip_top_dir(&name);
         if rel_path.is_empty() {
