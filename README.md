@@ -84,7 +84,8 @@ The upgrade command captures local customizations as a patch, downloads the
 target version to a staging directory, reapplies the patch with fuzzy matching,
 creates a backup zip of the current plugin, and swaps in the upgraded tree only
 after confirmation. If hunks fail, wpdiff writes patch/reject files for manual
-resolution.
+resolution. The backup, patch, and review files land in the working directory,
+so run `upgrade` from outside the plugin directory.
 
 ## Filtering
 

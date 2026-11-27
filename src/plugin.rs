@@ -1,59 +1,50 @@
 use anyhow::{Context, Result, bail};
+use log::debug;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
-struct HeaderPatterns {
-    plugin_name: Regex,
-    version: Regex,
-    text_domain: Regex,
+static PLUGIN_NAME: LazyLock<Regex> = LazyLock::new(|| header_field("Plugin Name"));
+static VERSION: LazyLock<Regex> = LazyLock::new(|| header_field("Version"));
+
+fn header_field(label: &str) -> Regex {
+    Regex::new(&format!(r"(?mi)^\s*\*?\s*{label}\s*:\s*(.+)$")).expect("header pattern is valid")
 }
 
-fn header_patterns() -> &'static HeaderPatterns {
-    static PATTERNS: OnceLock<HeaderPatterns> = OnceLock::new();
-    PATTERNS.get_or_init(|| HeaderPatterns {
-        plugin_name: Regex::new(r"(?mi)^\s*\*?\s*Plugin Name\s*:\s*(.+)$").unwrap(),
-        version: Regex::new(r"(?mi)^\s*\*?\s*Version\s*:\s*(.+)$").unwrap(),
-        text_domain: Regex::new(r"(?mi)^\s*\*?\s*Text Domain\s*:\s*(.+)$").unwrap(),
-    })
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct PluginMeta {
+    /// Directory name, which is also the plugin's wordpress.org identifier.
     pub slug: String,
     pub name: String,
+    /// Empty when the header has no `Version:` field.
     pub version: String,
-    pub text_domain: String,
     pub dir: PathBuf,
-    pub main_file: PathBuf,
 }
 
-pub fn parse_plugin_header(path: &Path) -> Result<Option<PluginMeta>> {
+pub fn locate(slug_or_path: &str, base_dir: Option<&Path>) -> Result<PluginMeta> {
+    debug!("Resolving plugin: {slug_or_path}");
+    discover_plugin(&resolve_plugin_path(slug_or_path, base_dir)?)
+}
+
+fn parse_plugin_header(dir: &Path, file: &Path) -> Result<Option<PluginMeta>> {
     let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
 
-    let patterns = header_patterns();
-
-    let name = extract_match(&patterns.plugin_name, &content);
-    if name.is_none() {
+    let Some(name) = extract_match(&PLUGIN_NAME, &content) else {
         return Ok(None);
-    }
-
-    let dir = path.parent().unwrap().to_path_buf();
+    };
+    debug!("Main file: {}", file.display());
     let slug = dir
         .file_name()
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
     Ok(Some(PluginMeta {
         slug,
-        name: name.unwrap_or_default(),
-        version: extract_match(&patterns.version, &content).unwrap_or_default(),
-        text_domain: extract_match(&patterns.text_domain, &content).unwrap_or_default(),
-        dir,
-        main_file: path.to_path_buf(),
+        name,
+        version: extract_match(&VERSION, &content).unwrap_or_default(),
+        dir: dir.to_path_buf(),
     }))
 }
 
@@ -73,10 +64,9 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
     }
 
     for entry in fs::read_dir(&path)? {
-        let entry = entry?;
-        let file_path = entry.path();
+        let file_path = entry?.path();
         if file_path.extension().is_some_and(|e| e == "php")
-            && let Some(meta) = parse_plugin_header(&file_path)?
+            && let Some(meta) = parse_plugin_header(&path, &file_path)?
         {
             return Ok(meta);
         }
@@ -90,14 +80,16 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
     )
 }
 
+/// Discovers every directory under the installation's plugins directory; the
+/// ones that are not plugins come back as errors.
 pub fn discover_all(wp_path: &Path) -> Result<Vec<Result<PluginMeta>>> {
     let plugins_dir = find_plugins_dir(wp_path)?;
     let mut results = Vec::new();
 
     for entry in fs::read_dir(&plugins_dir)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            results.push(discover_plugin(&entry.path()));
+        let path = entry?.path();
+        if path.is_dir() {
+            results.push(discover_plugin(&path));
         }
     }
 
@@ -111,26 +103,19 @@ fn find_plugins_dir(path: &Path) -> Result<PathBuf> {
         path.to_path_buf(),
     ];
 
-    for candidate in &candidates {
-        if candidate.is_dir() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    bail!(
-        "Could not find wp-content/plugins/ in {}.\n\
-         Use -C to specify the WordPress root directory.",
-        path.display()
-    )
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .with_context(|| {
+            format!(
+                "Could not find wp-content/plugins/ in {}.\n\
+                 Use -C to specify the WordPress root directory.",
+                path.display()
+            )
+        })
 }
 
 pub fn resolve_plugin_path(slug_or_path: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
-    let path = Path::new(slug_or_path);
-
-    if path.is_absolute() && path.is_dir() {
-        return Ok(path.to_path_buf());
-    }
-
     let base = match base_dir {
         Some(d) => d.to_path_buf(),
         None => std::env::current_dir()?,
@@ -141,16 +126,12 @@ pub fn resolve_plugin_path(slug_or_path: &str, base_dir: Option<&Path>) -> Resul
         return Ok(relative);
     }
 
-    let mut search = base.as_path();
-    loop {
-        let candidate = search.join("wp-content/plugins").join(slug_or_path);
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-        match search.parent() {
-            Some(parent) => search = parent,
-            None => break,
-        }
+    if let Some(installed) = base
+        .ancestors()
+        .map(|root| root.join("wp-content/plugins").join(slug_or_path))
+        .find(|candidate| candidate.is_dir())
+    {
+        return Ok(installed);
     }
 
     bail!(
@@ -162,204 +143,181 @@ pub fn resolve_plugin_path(slug_or_path: &str, base_dir: Option<&Path>) -> Resul
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_header_full() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("my-plugin");
-        fs::create_dir(&plugin_dir).unwrap();
-        let php = plugin_dir.join("my-plugin.php");
-        fs::write(
-            &php,
-            "<?php\n/*\nPlugin Name: My Plugin\nVersion: 2.1.0\nText Domain: my-plugin\n*/\n",
-        )
-        .unwrap();
-
-        let meta = parse_plugin_header(&php).unwrap().unwrap();
-        assert_eq!(meta.name, "My Plugin");
-        assert_eq!(meta.version, "2.1.0");
-        assert_eq!(meta.text_domain, "my-plugin");
-        assert_eq!(meta.slug, "my-plugin");
+    fn plugin_dir(root: &Path, slug: &str, main_file: &str, header: &str) -> PathBuf {
+        let dir = root.join(slug);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(main_file), header).unwrap();
+        dir
     }
 
     #[test]
-    fn parse_header_minimal() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("test");
-        fs::create_dir(&plugin_dir).unwrap();
-        let php = plugin_dir.join("test.php");
-        fs::write(&php, "<?php\n/*\nPlugin Name: Test\n*/\n").unwrap();
+    fn discover_reads_header_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(
+            root.path(),
+            "my-plugin",
+            "main.php",
+            "<?php\n/*\nPlugin Name: My Plugin\nVersion: 2.1.0\nText Domain: my-plugin\n*/\n",
+        );
 
-        let meta = parse_plugin_header(&php).unwrap().unwrap();
+        let meta = discover_plugin(&dir).unwrap();
+        assert_eq!(meta.name, "My Plugin");
+        assert_eq!(meta.version, "2.1.0");
+        assert_eq!(meta.slug, "my-plugin");
+        assert_eq!(meta.dir, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn discover_allows_missing_version() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(
+            root.path(),
+            "test",
+            "test.php",
+            "<?php\n/*\nPlugin Name: Test\n*/\n",
+        );
+
+        let meta = discover_plugin(&dir).unwrap();
         assert_eq!(meta.name, "Test");
         assert_eq!(meta.version, "");
     }
 
     #[test]
-    fn parse_header_no_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("nope");
-        fs::create_dir(&plugin_dir).unwrap();
-        let php = plugin_dir.join("nope.php");
-        fs::write(&php, "<?php\necho 'hello';\n").unwrap();
-
-        assert!(parse_plugin_header(&php).unwrap().is_none());
-    }
-
-    #[test]
-    fn parse_header_with_stars() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("starred");
-        fs::create_dir(&plugin_dir).unwrap();
-        let php = plugin_dir.join("starred.php");
-        fs::write(
-            &php,
+    fn discover_reads_docblock_style_header() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(
+            root.path(),
+            "starred",
+            "starred.php",
             "<?php\n/**\n * Plugin Name: Starred Plugin\n * Version: 1.0\n */\n",
-        )
-        .unwrap();
+        );
 
-        let meta = parse_plugin_header(&php).unwrap().unwrap();
+        let meta = discover_plugin(&dir).unwrap();
         assert_eq!(meta.name, "Starred Plugin");
         assert_eq!(meta.version, "1.0");
     }
 
     #[test]
-    fn discover_finds_plugin() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("akismet");
-        fs::create_dir(&plugin_dir).unwrap();
-        fs::write(
-            plugin_dir.join("akismet.php"),
+    fn discover_picks_the_file_with_the_header() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(
+            root.path(),
+            "akismet",
+            "akismet.php",
             "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
-        )
-        .unwrap();
-        fs::write(
-            plugin_dir.join("helper.php"),
-            "<?php\nfunction helper() {}\n",
-        )
-        .unwrap();
+        );
+        fs::write(dir.join("helper.php"), "<?php\nfunction helper() {}\n").unwrap();
+        fs::write(dir.join("notes.txt"), "Plugin Name: Not PHP\n").unwrap();
 
-        let meta = discover_plugin(&plugin_dir).unwrap();
-        assert_eq!(meta.slug, "akismet");
-        assert_eq!(meta.version, "5.0");
+        let meta = discover_plugin(&dir).unwrap();
+        assert_eq!(meta.name, "Akismet");
     }
 
     #[test]
     fn discover_no_plugin_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("empty");
-        fs::create_dir(&plugin_dir).unwrap();
-        fs::write(plugin_dir.join("index.php"), "<?php\n").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(root.path(), "empty", "index.php", "<?php\necho 'hello';\n");
 
-        assert!(discover_plugin(&plugin_dir).is_err());
+        assert!(discover_plugin(&dir).is_err());
     }
 
     #[test]
     fn resolve_absolute_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugin_dir = dir.path().join("test-plugin");
-        fs::create_dir(&plugin_dir).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("test-plugin");
+        fs::create_dir(&dir).unwrap();
 
-        let resolved = resolve_plugin_path(plugin_dir.to_str().unwrap(), None).unwrap();
-        assert_eq!(resolved, plugin_dir);
+        let resolved = resolve_plugin_path(dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(resolved, dir);
     }
 
     #[test]
     fn resolve_slug_with_base_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let wp = dir.path().join("wp-content/plugins/akismet");
-        fs::create_dir_all(&wp).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("wp-content/plugins/akismet");
+        fs::create_dir_all(&dir).unwrap();
 
-        let resolved = resolve_plugin_path("akismet", Some(dir.path())).unwrap();
-        assert_eq!(resolved, wp);
+        let resolved = resolve_plugin_path("akismet", Some(root.path())).unwrap();
+        assert_eq!(resolved, dir);
+    }
+
+    #[test]
+    fn resolve_slug_from_inside_the_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("wp-content/plugins/akismet");
+        let nested = root.path().join("wp-content/themes/mine");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        let resolved = resolve_plugin_path("akismet", Some(&nested)).unwrap();
+        assert_eq!(resolved, dir);
     }
 
     #[test]
     fn resolve_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(resolve_plugin_path("nonexistent", Some(dir.path())).is_err());
+        let root = tempfile::tempdir().unwrap();
+        assert!(resolve_plugin_path("nonexistent", Some(root.path())).is_err());
     }
 
     #[test]
     fn find_plugins_dir_standard() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugins = dir.path().join("wp-content/plugins");
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("wp-content/plugins");
         fs::create_dir_all(&plugins).unwrap();
 
-        let found = find_plugins_dir(dir.path()).unwrap();
-        assert_eq!(found, plugins);
+        assert_eq!(find_plugins_dir(root.path()).unwrap(), plugins);
+    }
+
+    #[test]
+    fn find_plugins_dir_inside_wp_content() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        fs::create_dir_all(root.path().join("themes")).unwrap();
+
+        assert_eq!(find_plugins_dir(root.path()).unwrap(), plugins);
+    }
+
+    #[test]
+    fn find_plugins_dir_accepts_the_plugins_directory_itself() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(find_plugins_dir(root.path()).unwrap(), root.path());
     }
 
     #[test]
     fn find_plugins_dir_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let subdir = dir.path().join("empty-site");
-        fs::create_dir(&subdir).unwrap();
-        // empty-site has no wp-content/plugins, no plugins/, and isn't itself a dir with subdirs
-        let deep = subdir.join("nope");
-        fs::create_dir(&deep).unwrap();
-        // find_plugins_dir checks candidates: path/wp-content/plugins, path/plugins, path itself
-        // path itself (deep) is a dir, so it returns Ok. Use a file instead.
-        let leaf = subdir.join("leaf-file");
-        fs::write(&leaf, "").unwrap();
-        // find_plugins_dir(subdir) - subdir has no wp-content/plugins or plugins/ subdir,
-        // but subdir itself IS a dir so it matches the third candidate.
-        // The function returns the first candidate that is_dir, which includes path itself.
-        // So it never errors for a real directory. Test with a nonexistent path.
-        let nonexistent = dir.path().join("does-not-exist");
-        assert!(find_plugins_dir(&nonexistent).is_err());
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_plugins_dir(&root.path().join("does-not-exist")).is_err());
     }
 
     #[test]
-    fn discover_all_finds_plugins() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugins = dir.path().join("wp-content/plugins");
-        let p1 = plugins.join("akismet");
-        let p2 = plugins.join("hello-dolly");
-        fs::create_dir_all(&p1).unwrap();
-        fs::create_dir_all(&p2).unwrap();
-        fs::write(
-            p1.join("akismet.php"),
+    fn discover_all_reports_plugins_and_non_plugins() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = root.path().join("wp-content/plugins");
+        plugin_dir(
+            &plugins,
+            "akismet",
+            "akismet.php",
             "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
-        )
-        .unwrap();
-        fs::write(
-            p2.join("hello.php"),
+        );
+        plugin_dir(
+            &plugins,
+            "hello-dolly",
+            "hello.php",
             "<?php\n/*\nPlugin Name: Hello Dolly\nVersion: 1.7\n*/\n",
-        )
-        .unwrap();
+        );
+        plugin_dir(&plugins, "not-a-plugin", "readme.txt", "not a plugin");
+        fs::write(plugins.join("index.php"), "<?php // Silence is golden.\n").unwrap();
 
-        let results = discover_all(dir.path()).unwrap();
-        let slugs: Vec<String> = results
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|m| m.slug)
+        let results = discover_all(root.path()).unwrap();
+        let mut slugs: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|m| m.slug.as_str())
             .collect();
+        slugs.sort_unstable();
 
-        assert_eq!(slugs.len(), 2);
-        assert!(slugs.contains(&"akismet".to_string()));
-        assert!(slugs.contains(&"hello-dolly".to_string()));
-    }
-
-    #[test]
-    fn discover_all_skips_non_plugin_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let plugins = dir.path().join("wp-content/plugins");
-        let p1 = plugins.join("akismet");
-        let p2 = plugins.join("not-a-plugin");
-        fs::create_dir_all(&p1).unwrap();
-        fs::create_dir_all(&p2).unwrap();
-        fs::write(
-            p1.join("akismet.php"),
-            "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
-        )
-        .unwrap();
-        fs::write(p2.join("readme.txt"), "not a plugin").unwrap();
-
-        let results = discover_all(dir.path()).unwrap();
-        let ok_count = results.iter().filter(|r| r.is_ok()).count();
-        let err_count = results.iter().filter(|r| r.is_err()).count();
-
-        assert_eq!(ok_count, 1);
-        assert_eq!(err_count, 1);
+        assert_eq!(slugs, ["akismet", "hello-dolly"]);
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
     }
 }

@@ -39,7 +39,8 @@ static Linux release targets (`x86_64-unknown-linux-musl` and
   version, or flag to fix.
 - Keep filesystem mutations explicit and late. Prefer staging directories and
   atomic-ish swaps over in-place edits.
-- Progress bars are suppressed during parallel work with `progress::suppress()`.
+- Progress bars created on rayon worker threads are hidden by `progress.rs`
+  itself; parallel code needs no extra suppression.
 - Default diff output hides generated artifacts and binary assets; keep filtering
   changes additive and predictable.
 - No comments that repeat what the code already says. Add comments only to
@@ -50,11 +51,12 @@ static Linux release targets (`x86_64-unknown-linux-musl` and
 - `src/main.rs` — CLI definitions, subcommand dispatch, and top-level command
   flow.
 - `src/plugin.rs` — WordPress plugin discovery and plugin-header parsing.
-- `src/source.rs` — upstream source abstraction and wordpress.org downloader /
-  version API.
+- `src/source.rs` — wordpress.org client: package download/extraction and the
+  plugin version API.
 - `src/diff.rs` — directory diffing, file categorization, filtering, and skip
   rules.
-- `src/output.rs` — terminal, JSON, unified diff, and summary/table renderers.
+- `src/output.rs` — the per-plugin `Report` and its terminal, JSON, and
+  summary/table renderers.
 - `src/upgrade.rs` — staging, backup, patch capture/reapply, conflict handling,
   and final plugin replacement.
-- `src/progress.rs` — progress bar/spinner helpers and parallel suppression.
+- `src/progress.rs` — progress bar/spinner helpers, hidden inside parallel work.

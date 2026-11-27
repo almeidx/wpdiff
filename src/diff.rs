@@ -1,95 +1,59 @@
 use crate::progress;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, trace};
 use serde::Serialize;
-use similar::TextDiff;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use similar::{DiffTag, TextDiff};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DiffResult {
-    pub plugin_slug: String,
-    pub plugin_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_version: Option<String>,
+#[derive(Debug, Serialize)]
+pub struct DirDiff {
     pub files: Vec<FileDiff>,
     pub skipped_dirs: SkippedDirs,
     pub summary: DiffSummary,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl DirDiff {
+    pub fn new(files: Vec<FileDiff>, skipped_dirs: SkippedDirs, unchanged: usize) -> Self {
+        let summary = DiffSummary::of(&files, unchanged);
+        Self {
+            files,
+            skipped_dirs,
+            summary,
+        }
+    }
+
+    /// `summary.unchanged` keeps counting every identical file, whatever its
+    /// category.
+    #[must_use]
+    pub fn filtered(mut self, filter: &Filter) -> Self {
+        self.files.retain(|f| filter.accepts(f));
+        self.summary = DiffSummary::of(&self.files, self.summary.unchanged);
+        self
+    }
+
+    /// All file diffs as one unified patch (upstream → local).
+    pub fn patch(&self) -> String {
+        self.files.iter().map(|f| f.diff_text.as_str()).collect()
+    }
+
+    /// Total `(insertions, deletions)` across all files.
+    pub fn line_changes(&self) -> (usize, usize) {
+        self.files.iter().fold((0, 0), |(ins, del), f| {
+            (ins + f.insertions, del + f.deletions)
+        })
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct SkippedDirs {
     pub local: Vec<String>,
     pub upstream: Vec<String>,
 }
 
-impl DiffResult {
-    fn with_files(&self, files: Vec<FileDiff>) -> Self {
-        let mut by_category = BTreeMap::new();
-        let mut added = 0;
-        let mut removed = 0;
-        let mut modified = 0;
-
-        for f in &files {
-            CategorySummary::tally(&mut by_category, f.category, f.status);
-            match f.status {
-                FileStatus::Added => added += 1,
-                FileStatus::Removed => removed += 1,
-                FileStatus::Modified => modified += 1,
-            }
-        }
-
-        Self {
-            plugin_slug: self.plugin_slug.clone(),
-            plugin_version: self.plugin_version.clone(),
-            latest_version: self.latest_version.clone(),
-            files,
-            skipped_dirs: self.skipped_dirs.clone(),
-            summary: DiffSummary {
-                added,
-                removed,
-                modified,
-                unchanged: self.summary.unchanged,
-                by_category,
-            },
-        }
-    }
-
-    pub fn apply(&self, categories: &HashSet<FileCategory>, exclude_patterns: &[String]) -> Self {
-        let expanded: Vec<String> = exclude_patterns
-            .iter()
-            .flat_map(|p| {
-                if p.contains('*') || p.contains('?') || p.contains('[') {
-                    vec![p.clone()]
-                } else {
-                    let trimmed = p.trim_end_matches('/');
-                    vec![
-                        trimmed.to_string(),
-                        format!("{trimmed}/**"),
-                        format!("**/{trimmed}"),
-                        format!("**/{trimmed}/**"),
-                    ]
-                }
-            })
-            .collect();
-
-        let files = self
-            .files
-            .iter()
-            .filter(|f| {
-                categories.contains(&f.category)
-                    && (expanded.is_empty()
-                        || !expanded.iter().any(|p| glob_match::glob_match(p, &f.path)))
-            })
-            .cloned()
-            .collect();
-        self.with_files(files)
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct DiffSummary {
     pub added: usize,
     pub removed: usize,
@@ -98,29 +62,34 @@ pub struct DiffSummary {
     pub by_category: BTreeMap<FileCategory, CategorySummary>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+impl DiffSummary {
+    fn of(files: &[FileDiff], unchanged: usize) -> Self {
+        let mut summary = Self {
+            unchanged,
+            ..Self::default()
+        };
+        for file in files {
+            let category = summary.by_category.entry(file.category).or_default();
+            let (total, in_category) = match file.status {
+                FileStatus::Added => (&mut summary.added, &mut category.added),
+                FileStatus::Removed => (&mut summary.removed, &mut category.removed),
+                FileStatus::Modified => (&mut summary.modified, &mut category.modified),
+            };
+            *total += 1;
+            *in_category += 1;
+        }
+        summary
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct CategorySummary {
     pub added: usize,
     pub removed: usize,
     pub modified: usize,
 }
 
-impl CategorySummary {
-    pub(crate) fn tally(
-        map: &mut BTreeMap<FileCategory, Self>,
-        category: FileCategory,
-        status: FileStatus,
-    ) {
-        let entry = map.entry(category).or_default();
-        match status {
-            FileStatus::Added => entry.added += 1,
-            FileStatus::Removed => entry.removed += 1,
-            FileStatus::Modified => entry.modified += 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct FileDiff {
     pub path: String,
     pub status: FileStatus,
@@ -128,6 +97,34 @@ pub struct FileDiff {
     pub insertions: usize,
     pub deletions: usize,
     pub diff_text: String,
+}
+
+impl FileDiff {
+    fn new(path: &str, status: FileStatus, upstream: &str, local: &str) -> Self {
+        let diff = TextDiff::from_lines(upstream, local);
+        let mut insertions = 0;
+        let mut deletions = 0;
+        for op in diff.ops() {
+            match op.tag() {
+                DiffTag::Equal => {}
+                DiffTag::Insert => insertions += op.new_range().len(),
+                DiffTag::Delete => deletions += op.old_range().len(),
+                DiffTag::Replace => {
+                    insertions += op.new_range().len();
+                    deletions += op.old_range().len();
+                }
+            }
+        }
+
+        Self {
+            path: path.to_string(),
+            status,
+            category: categorize_file(path),
+            insertions,
+            deletions,
+            diff_text: format_unified(&diff, &format!("a/{path}"), &format!("b/{path}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,7 +135,8 @@ pub enum FileStatus {
     Modified,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+/// Declared in the order categories are listed in output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileCategory {
     Source,
@@ -147,258 +145,198 @@ pub enum FileCategory {
     Metadata,
 }
 
-impl std::fmt::Display for FileCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Source => write!(f, "source"),
-            Self::Artifact => write!(f, "artifact"),
-            Self::Asset => write!(f, "asset"),
-            Self::Metadata => write!(f, "metadata"),
+#[derive(Debug, Default)]
+pub struct Filter {
+    include_artifacts: bool,
+    include_assets: bool,
+    exclude_globs: Vec<String>,
+}
+
+impl Filter {
+    /// `exclude` entries are globs; an entry without glob syntax names a file
+    /// or directory to drop at any depth.
+    pub fn new(include_artifacts: bool, include_assets: bool, exclude: &[String]) -> Self {
+        let exclude_globs = exclude
+            .iter()
+            .flat_map(|pattern| {
+                if pattern.contains(['*', '?', '[']) {
+                    return vec![pattern.clone()];
+                }
+                let name = pattern.trim_end_matches('/');
+                vec![
+                    name.to_string(),
+                    format!("{name}/**"),
+                    format!("**/{name}"),
+                    format!("**/{name}/**"),
+                ]
+            })
+            .collect();
+
+        Self {
+            include_artifacts,
+            include_assets,
+            exclude_globs,
         }
+    }
+
+    fn accepts(&self, file: &FileDiff) -> bool {
+        let category_included = match file.category {
+            FileCategory::Source | FileCategory::Metadata => true,
+            FileCategory::Artifact => self.include_artifacts,
+            FileCategory::Asset => self.include_assets,
+        };
+        category_included
+            && !self
+                .exclude_globs
+                .iter()
+                .any(|glob| glob_match::glob_match(glob, &file.path))
     }
 }
 
 pub fn diff_directories(
     local_dir: &Path,
     upstream_dir: &Path,
-    slug: &str,
-    version: &str,
     strict_whitespace: bool,
-) -> Result<DiffResult> {
-    let local_result = collect_files(local_dir)?;
-    let upstream_result = collect_files(upstream_dir)?;
-
-    let local_files = local_result.files;
-    let upstream_files = upstream_result.files;
-
-    let skipped_dirs = SkippedDirs {
-        local: local_result.skipped,
-        upstream: upstream_result.skipped,
-    };
+) -> Result<DirDiff> {
+    let local = collect_files(local_dir)?;
+    let upstream = collect_files(upstream_dir)?;
 
     debug!(
         "Comparing {} local files against {} upstream files",
-        local_files.len(),
-        upstream_files.len()
+        local.files.len(),
+        upstream.files.len()
     );
-
-    if !skipped_dirs.local.is_empty() {
-        debug!("Skipped local dirs: {}", skipped_dirs.local.join(", "));
+    if !local.skipped_dirs.is_empty() {
+        debug!("Skipped local dirs: {}", local.skipped_dirs.join(", "));
     }
-    if !skipped_dirs.upstream.is_empty() {
+    if !upstream.skipped_dirs.is_empty() {
         debug!(
             "Skipped upstream dirs: {}",
-            skipped_dirs.upstream.join(", ")
+            upstream.skipped_dirs.join(", ")
         );
     }
 
-    let mut files = Vec::new();
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut modified = 0usize;
-    let mut unchanged = 0usize;
-    let mut by_category: BTreeMap<FileCategory, CategorySummary> = BTreeMap::new();
-
-    let total_files = upstream_files.len() + local_files.len();
+    let paths: Vec<&String> = local.files.union(&upstream.files).collect();
     let pb = progress::bar(
-        total_files as u64,
+        paths.len() as u64,
         "  {spinner:.green} Comparing [{bar:30.cyan/dim}] {pos}/{len} files",
     );
 
-    for rel_path in &upstream_files {
-        if !local_files.contains(rel_path) {
-            trace!("Removed from local: {rel_path}");
-            let category = categorize_file(rel_path);
-            let upstream_raw = read_file_lossy(&upstream_dir.join(rel_path));
-            let upstream_content = prepare_content(&upstream_raw, strict_whitespace);
-            let diff_text = make_unified_diff(
-                &upstream_content,
-                "",
-                &format!("a/{rel_path}"),
-                &format!("b/{rel_path}"),
-            );
+    let mut files = Vec::new();
+    let mut unchanged = 0usize;
 
-            let (ins, del) = count_changes(&diff_text);
-            files.push(FileDiff {
-                path: rel_path.clone(),
-                status: FileStatus::Removed,
-                category,
-                insertions: ins,
-                deletions: del,
-                diff_text,
-            });
-            removed += 1;
-            CategorySummary::tally(&mut by_category, category, FileStatus::Removed);
-        }
-        pb.inc(1);
-    }
+    for rel_path in paths {
+        let status = match (
+            upstream.files.contains(rel_path),
+            local.files.contains(rel_path),
+        ) {
+            (true, true) => FileStatus::Modified,
+            (true, false) => FileStatus::Removed,
+            (false, _) => FileStatus::Added,
+        };
 
-    for rel_path in &local_files {
-        let category = categorize_file(rel_path);
-
-        if upstream_files.contains(rel_path) {
-            let local_path = local_dir.join(rel_path);
-            let upstream_path = upstream_dir.join(rel_path);
-
-            let local_raw = read_file_lossy(&local_path);
-            let upstream_raw = read_file_lossy(&upstream_path);
-
-            let local_norm;
-            let upstream_norm;
-            let (local_cmp, upstream_cmp) = if strict_whitespace {
-                (local_raw.as_str(), upstream_raw.as_str())
-            } else {
-                local_norm = normalize_whitespace(&local_raw);
-                upstream_norm = normalize_whitespace(&upstream_raw);
-                (local_norm.as_str(), upstream_norm.as_str())
-            };
-
-            if local_cmp == upstream_cmp {
-                unchanged += 1;
-                pb.inc(1);
-                continue;
-            }
-
-            let diff_text = make_unified_diff(
-                upstream_cmp,
-                local_cmp,
-                &format!("a/{rel_path}"),
-                &format!("b/{rel_path}"),
-            );
-
-            if diff_text.is_empty() {
-                unchanged += 1;
-                pb.inc(1);
-                continue;
-            }
-
-            let (ins, del) = count_changes(&diff_text);
-            files.push(FileDiff {
-                path: rel_path.clone(),
-                status: FileStatus::Modified,
-                category,
-                insertions: ins,
-                deletions: del,
-                diff_text,
-            });
-            modified += 1;
-            CategorySummary::tally(&mut by_category, category, FileStatus::Modified);
-        } else {
+        let upstream_text = if status == FileStatus::Added {
             trace!("Added locally: {rel_path}");
-            let local_raw = read_file_lossy(&local_dir.join(rel_path));
-            let local_content = prepare_content(&local_raw, strict_whitespace);
-            let diff_text = make_unified_diff(
-                "",
-                &local_content,
-                &format!("a/{rel_path}"),
-                &format!("b/{rel_path}"),
-            );
-
-            let (ins, del) = count_changes(&diff_text);
-            files.push(FileDiff {
-                path: rel_path.clone(),
-                status: FileStatus::Added,
-                category,
-                insertions: ins,
-                deletions: del,
-                diff_text,
-            });
-            added += 1;
-            CategorySummary::tally(&mut by_category, category, FileStatus::Added);
-        }
+            String::new()
+        } else {
+            read_text(&upstream_dir.join(rel_path), strict_whitespace)?
+        };
+        let local_text = if status == FileStatus::Removed {
+            trace!("Removed from local: {rel_path}");
+            String::new()
+        } else {
+            read_text(&local_dir.join(rel_path), strict_whitespace)?
+        };
         pb.inc(1);
+
+        if status == FileStatus::Modified && upstream_text == local_text {
+            unchanged += 1;
+            continue;
+        }
+        files.push(FileDiff::new(rel_path, status, &upstream_text, &local_text));
     }
     pb.finish_and_clear();
 
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-
-    debug!(
-        "Diff complete: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
-    );
-
-    Ok(DiffResult {
-        plugin_slug: slug.to_string(),
-        plugin_version: version.to_string(),
-        latest_version: None,
+    let result = DirDiff::new(
         files,
-        skipped_dirs,
-        summary: DiffSummary {
-            added,
-            removed,
-            modified,
-            unchanged,
-            by_category,
+        SkippedDirs {
+            local: local.skipped_dirs,
+            upstream: upstream.skipped_dirs,
         },
-    })
+        unchanged,
+    );
+    debug!(
+        "Diff complete: {} added, {} removed, {} modified, {} unchanged",
+        result.summary.added,
+        result.summary.removed,
+        result.summary.modified,
+        result.summary.unchanged
+    );
+    Ok(result)
 }
 
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "external",
-    ".git",
-    ".svn",
-    ".hg",
-    "vendor",
-    ".DS_Store",
-];
+/// Lines of unchanged context around each change in a unified diff.
+pub const CONTEXT_RADIUS: usize = 3;
 
-pub fn should_skip_dir(name: &std::ffi::OsStr) -> bool {
-    let s = name.to_string_lossy();
-    SKIP_DIRS.iter().any(|&d| s == d)
+/// Unified diff of two texts, or an empty string when they are equal.
+pub fn unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
+    format_unified(&TextDiff::from_lines(old, new), old_label, new_label)
 }
 
-struct CollectResult {
+fn format_unified(diff: &TextDiff<'_, '_, str>, old_label: &str, new_label: &str) -> String {
+    diff.unified_diff()
+        .header(old_label, new_label)
+        .context_radius(CONTEXT_RADIUS)
+        .to_string()
+}
+
+const SKIP_DIRS: &[&str] = &["node_modules", "external", ".git", ".svn", ".hg", "vendor"];
+
+struct Tree {
+    /// Paths relative to the root.
     files: BTreeSet<String>,
-    skipped: Vec<String>,
+    /// Top-level directories that were not walked.
+    skipped_dirs: Vec<String>,
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn collect_files(dir: &Path) -> Result<CollectResult> {
-    use std::cell::RefCell;
+fn collect_files(dir: &Path) -> Result<Tree> {
+    let mut files = BTreeSet::new();
+    let mut skipped_dirs = Vec::new();
 
-    let files = RefCell::new(BTreeSet::new());
-    let skipped = RefCell::new(Vec::new());
+    let mut walker = WalkDir::new(dir).min_depth(1).into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+        let file_type = entry.file_type();
 
-    let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir()
-            && e.depth() > 0
-            && let Some(name) = e.path().file_name()
-            && should_skip_dir(name)
-        {
-            if e.depth() == 1 {
-                skipped
-                    .borrow_mut()
-                    .push(name.to_string_lossy().to_string());
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            if SKIP_DIRS.iter().any(|skip| name == *skip) {
+                if entry.depth() == 1 {
+                    skipped_dirs.push(name.to_string_lossy().into_owned());
+                }
+                walker.skip_current_dir();
             }
-            return false;
-        }
-        true
-    });
-
-    for entry in walker.filter_map(std::result::Result::ok) {
-        if entry.file_type().is_file() {
-            let rel = entry
-                .path()
-                .strip_prefix(dir)
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            files.borrow_mut().insert(rel);
+        } else if file_type.is_file() {
+            let rel = entry.path().strip_prefix(dir)?;
+            files.insert(rel.to_string_lossy().into_owned());
         }
     }
 
-    let mut skipped = skipped.into_inner();
-    skipped.sort();
-    Ok(CollectResult {
-        files: files.into_inner(),
-        skipped,
+    skipped_dirs.sort();
+    Ok(Tree {
+        files,
+        skipped_dirs,
     })
 }
 
-fn read_file_lossy(path: &Path) -> String {
-    fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .unwrap_or_default()
+fn read_text(path: &Path, strict_whitespace: bool) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(if strict_whitespace {
+        text.into_owned()
+    } else {
+        normalize_whitespace(&text)
+    })
 }
 
 fn normalize_whitespace(content: &str) -> String {
@@ -411,600 +349,327 @@ fn normalize_whitespace(content: &str) -> String {
         .join("\n")
 }
 
-fn make_unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> String {
-    if old == new {
-        return String::new();
-    }
+const ARTIFACT_DIRS: &[&str] = &["node_modules/", "vendor/", "dist/", "build/", ".git/"];
+const ARTIFACT_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".map", ".bundle.js", ".chunk.js"];
+const ASSET_SUFFIXES: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff", ".woff", ".woff2",
+    ".ttf", ".eot", ".otf", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".zip", ".tar", ".gz",
+];
+const METADATA_FILES: &[&str] = &[
+    "readme.txt",
+    "readme.md",
+    "changelog.md",
+    "changelog.txt",
+    "license.txt",
+    "license.md",
+    "license",
+];
+const METADATA_SUFFIXES: &[&str] = &[".pot", ".po", ".mo"];
 
-    let diff = TextDiff::from_lines(old, new);
-    diff.unified_diff()
-        .header(old_label, new_label)
-        .context_radius(3)
-        .to_string()
-}
-
-fn prepare_content(raw: &str, strict_whitespace: bool) -> String {
-    if strict_whitespace {
-        raw.to_string()
-    } else {
-        normalize_whitespace(raw)
-    }
-}
-
-fn count_changes(diff_text: &str) -> (usize, usize) {
-    let mut insertions = 0;
-    let mut deletions = 0;
-    for line in diff_text.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            insertions += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            deletions += 1;
-        }
-    }
-    (insertions, deletions)
-}
-
-pub fn categorize_file(path: &str) -> FileCategory {
+fn categorize_file(path: &str) -> FileCategory {
     let lower = path.to_lowercase();
+    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| lower.ends_with(s));
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
 
-    let artifact_dirs = ["node_modules/", "vendor/", "dist/", "build/", ".git/"];
-    for dir in &artifact_dirs {
-        if lower.contains(dir) {
-            return FileCategory::Artifact;
-        }
+    if ARTIFACT_DIRS.iter().any(|dir| lower.contains(dir)) || ends_with_any(ARTIFACT_SUFFIXES) {
+        FileCategory::Artifact
+    } else if ends_with_any(ASSET_SUFFIXES) {
+        FileCategory::Asset
+    } else if METADATA_FILES.contains(&file_name) || ends_with_any(METADATA_SUFFIXES) {
+        FileCategory::Metadata
+    } else {
+        FileCategory::Source
     }
-
-    if lower.ends_with(".min.js")
-        || lower.ends_with(".min.css")
-        || lower.ends_with(".map")
-        || lower.ends_with(".bundle.js")
-        || lower.ends_with(".chunk.js")
-    {
-        return FileCategory::Artifact;
-    }
-
-    let asset_exts = [
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff", ".woff",
-        ".woff2", ".ttf", ".eot", ".otf", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".zip", ".tar",
-        ".gz",
-    ];
-    for ext in &asset_exts {
-        if lower.ends_with(ext) {
-            return FileCategory::Asset;
-        }
-    }
-
-    let metadata_files = [
-        "readme.txt",
-        "readme.md",
-        "changelog.md",
-        "changelog.txt",
-        "license.txt",
-        "license.md",
-        "license",
-    ];
-    let filename = Path::new(&lower)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-    for mf in &metadata_files {
-        if filename == *mf {
-            return FileCategory::Metadata;
-        }
-    }
-
-    if lower.ends_with(".pot") || lower.ends_with(".po") || lower.ends_with(".mo") {
-        return FileCategory::Metadata;
-    }
-
-    FileCategory::Source
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn tree(files: &[(&str, &str)]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        dir
+    }
+
+    fn diff_trees(local: &[(&str, &str)], upstream: &[(&str, &str)], strict: bool) -> DirDiff {
+        diff_directories(tree(local).path(), tree(upstream).path(), strict).unwrap()
+    }
+
+    fn changed(paths: &[(&str, FileStatus)]) -> DirDiff {
+        let files = paths
+            .iter()
+            .map(|(path, status)| FileDiff::new(path, *status, "", ""))
+            .collect();
+        DirDiff::new(files, SkippedDirs::default(), 0)
+    }
+
+    fn paths(diff: &DirDiff) -> Vec<&str> {
+        diff.files.iter().map(|f| f.path.as_str()).collect()
+    }
+
+    fn exclude(patterns: &[&str]) -> Filter {
+        let patterns: Vec<String> = patterns.iter().map(ToString::to_string).collect();
+        Filter::new(false, false, &patterns)
+    }
 
     #[test]
-    fn categorize_source_files() {
-        assert_eq!(categorize_file("src/foo.php"), FileCategory::Source);
+    fn categorize_one_file_of_each_kind() {
         assert_eq!(
             categorize_file("includes/class-wc.php"),
             FileCategory::Source
         );
-        assert_eq!(categorize_file("style.css"), FileCategory::Source);
-        assert_eq!(categorize_file("app.js"), FileCategory::Source);
-        assert_eq!(categorize_file("template.html"), FileCategory::Source);
-    }
-
-    #[test]
-    fn categorize_artifacts_by_dir() {
-        assert_eq!(
-            categorize_file("node_modules/lodash/index.js"),
-            FileCategory::Artifact
-        );
-        assert_eq!(
-            categorize_file("vendor/autoload.php"),
-            FileCategory::Artifact
-        );
         assert_eq!(categorize_file("dist/bundle.js"), FileCategory::Artifact);
-        assert_eq!(categorize_file("build/output.css"), FileCategory::Artifact);
-        assert_eq!(categorize_file(".git/config"), FileCategory::Artifact);
-    }
-
-    #[test]
-    fn categorize_artifacts_by_extension() {
         assert_eq!(categorize_file("app.min.js"), FileCategory::Artifact);
-        assert_eq!(categorize_file("style.min.css"), FileCategory::Artifact);
-        assert_eq!(categorize_file("app.bundle.js"), FileCategory::Artifact);
-        assert_eq!(categorize_file("vendor.chunk.js"), FileCategory::Artifact);
-        assert_eq!(categorize_file("app.js.map"), FileCategory::Artifact);
-    }
-
-    #[test]
-    fn categorize_assets() {
-        assert_eq!(categorize_file("logo.png"), FileCategory::Asset);
-        assert_eq!(categorize_file("photo.jpg"), FileCategory::Asset);
-        assert_eq!(categorize_file("icon.svg"), FileCategory::Asset);
         assert_eq!(categorize_file("font.woff2"), FileCategory::Asset);
-        assert_eq!(categorize_file("video.mp4"), FileCategory::Asset);
-    }
-
-    #[test]
-    fn categorize_metadata() {
-        assert_eq!(categorize_file("readme.txt"), FileCategory::Metadata);
-        assert_eq!(categorize_file("README.md"), FileCategory::Metadata);
         assert_eq!(categorize_file("changelog.txt"), FileCategory::Metadata);
-        assert_eq!(categorize_file("LICENSE.txt"), FileCategory::Metadata);
-        assert_eq!(categorize_file("license"), FileCategory::Metadata);
-        assert_eq!(
-            categorize_file("languages/plugin.pot"),
-            FileCategory::Metadata
-        );
         assert_eq!(categorize_file("languages/en.po"), FileCategory::Metadata);
-        assert_eq!(categorize_file("languages/en.mo"), FileCategory::Metadata);
     }
 
     #[test]
-    fn categorize_artifact_dir_mid_path() {
+    fn categorize_ignores_case() {
+        assert_eq!(categorize_file("README.md"), FileCategory::Metadata);
+        assert_eq!(categorize_file("Assets/Logo.PNG"), FileCategory::Asset);
         assert_eq!(
-            categorize_file("src/dist/output.js"),
+            categorize_file("Vendor/autoload.php"),
             FileCategory::Artifact
         );
     }
 
     #[test]
-    fn normalize_crlf() {
-        assert_eq!(normalize_whitespace("a\r\nb\r\n"), "a\nb");
-        assert_eq!(normalize_whitespace("a\rb\r"), "a\nb");
+    fn categorize_generated_locations_win_over_file_type() {
+        assert_eq!(categorize_file("src/dist/logo.png"), FileCategory::Artifact);
+        assert_eq!(categorize_file("build/readme.txt"), FileCategory::Artifact);
     }
 
     #[test]
-    fn normalize_trailing_spaces() {
-        assert_eq!(normalize_whitespace("hello   \nworld\t\n"), "hello\nworld");
+    fn categorize_metadata_name_only_matches_whole_file_name() {
+        assert_eq!(categorize_file("docs/license"), FileCategory::Metadata);
+        assert_eq!(categorize_file("my-license"), FileCategory::Source);
     }
 
     #[test]
-    fn normalize_empty() {
-        assert_eq!(normalize_whitespace(""), "");
+    fn unified_diff_of_equal_texts_is_empty() {
+        assert_eq!(unified_diff("hello\n", "hello\n", "a", "b"), "");
+        assert_eq!(unified_diff("", "", "a", "b"), "");
     }
 
     #[test]
-    fn count_changes_basic() {
-        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n context\n";
-        let (ins, del) = count_changes(diff);
-        assert_eq!(ins, 1);
-        assert_eq!(del, 1);
+    fn unified_diff_has_labels_and_changes() {
+        let diff = unified_diff("old line\n", "new line\n", "a/f", "b/f");
+        assert_eq!(
+            diff,
+            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old line\n+new line\n"
+        );
     }
 
     #[test]
-    fn count_changes_excludes_headers() {
-        let diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n";
-        let (ins, del) = count_changes(diff);
-        assert_eq!(ins, 1);
-        assert_eq!(del, 1);
+    fn line_counts_include_lines_that_look_like_diff_headers() {
+        let file = FileDiff::new(
+            "q.sql",
+            FileStatus::Modified,
+            "keep\n-- old comment\n",
+            "keep\n++ new marker\nextra\n",
+        );
+        assert_eq!((file.insertions, file.deletions), (2, 1));
     }
 
     #[test]
-    fn count_changes_empty() {
-        assert_eq!(count_changes(""), (0, 0));
+    fn filter_hides_artifacts_and_assets_unless_included() {
+        let all = [
+            ("src/a.php", FileStatus::Modified),
+            ("readme.txt", FileStatus::Modified),
+            ("app.min.js", FileStatus::Modified),
+            ("logo.png", FileStatus::Added),
+        ];
+
+        let default = changed(&all).filtered(&Filter::default());
+        assert_eq!(paths(&default), ["src/a.php", "readme.txt"]);
+
+        let artifacts = changed(&all).filtered(&Filter::new(true, false, &[]));
+        assert_eq!(paths(&artifacts), ["src/a.php", "readme.txt", "app.min.js"]);
+
+        let assets = changed(&all).filtered(&Filter::new(false, true, &[]));
+        assert_eq!(paths(&assets), ["src/a.php", "readme.txt", "logo.png"]);
     }
 
     #[test]
-    fn make_diff_identical() {
-        assert_eq!(make_unified_diff("hello\n", "hello\n", "a", "b"), "");
-    }
-
-    #[test]
-    fn make_diff_added() {
-        let diff = make_unified_diff("", "new line\n", "a/f", "b/f");
-        assert!(diff.contains("+new line"));
-        assert!(diff.contains("--- a/f"));
-        assert!(diff.contains("+++ b/f"));
-    }
-
-    #[test]
-    fn make_diff_removed() {
-        let diff = make_unified_diff("old line\n", "", "a/f", "b/f");
-        assert!(diff.contains("-old line"));
-    }
-
-    #[test]
-    fn skip_dir_known() {
-        assert!(should_skip_dir(std::ffi::OsStr::new("node_modules")));
-        assert!(should_skip_dir(std::ffi::OsStr::new("vendor")));
-        assert!(should_skip_dir(std::ffi::OsStr::new(".git")));
-        assert!(should_skip_dir(std::ffi::OsStr::new("external")));
-    }
-
-    #[test]
-    fn skip_dir_not_prefix() {
-        assert!(!should_skip_dir(std::ffi::OsStr::new("vendor_custom")));
-        assert!(!should_skip_dir(std::ffi::OsStr::new("src")));
-        assert!(!should_skip_dir(std::ffi::OsStr::new("includes")));
-    }
-
-    #[test]
-    fn tally_increments_correctly() {
-        let mut map = BTreeMap::new();
-        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Added);
-        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Added);
-        CategorySummary::tally(&mut map, FileCategory::Source, FileStatus::Modified);
-        CategorySummary::tally(&mut map, FileCategory::Asset, FileStatus::Removed);
-
-        assert_eq!(map[&FileCategory::Source].added, 2);
-        assert_eq!(map[&FileCategory::Source].modified, 1);
-        assert_eq!(map[&FileCategory::Source].removed, 0);
-        assert_eq!(map[&FileCategory::Asset].removed, 1);
-    }
-
-    #[test]
-    fn prepare_content_strict_preserves_crlf() {
-        let raw = "hello\r\nworld\r\n";
-        assert_eq!(prepare_content(raw, true), raw);
-    }
-
-    #[test]
-    fn prepare_content_nonstrict_normalizes() {
-        assert_eq!(prepare_content("hello\r\n", false), "hello");
-    }
-
-    #[test]
-    fn apply_filters_categories() {
-        let result = make_test_result(vec![
-            ("src/a.php", FileCategory::Source, FileStatus::Modified),
-            ("app.min.js", FileCategory::Artifact, FileStatus::Modified),
-            ("logo.png", FileCategory::Asset, FileStatus::Added),
+    fn exclude_bare_name_drops_directory_at_any_depth() {
+        let diff = changed(&[
+            ("a/b/c.php", FileStatus::Modified),
+            ("x/a/d.php", FileStatus::Modified),
+            ("a.php", FileStatus::Modified),
+            ("e.php", FileStatus::Modified),
         ]);
-
-        let cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&cats, &[]);
-        assert_eq!(filtered.files.len(), 1);
-        assert_eq!(filtered.files[0].path, "src/a.php");
+        assert_eq!(paths(&diff.filtered(&exclude(&["a"]))), ["a.php", "e.php"]);
     }
 
     #[test]
-    fn apply_filters_exclude_bare_name() {
-        let result = make_test_result(vec![
-            (
-                "assets/js/app.js",
-                FileCategory::Source,
-                FileStatus::Modified,
-            ),
-            (
-                "includes/foo.php",
-                FileCategory::Source,
-                FileStatus::Modified,
-            ),
+    fn exclude_trailing_slash_is_ignored() {
+        let diff = changed(&[
+            ("assets/js/app.js", FileStatus::Modified),
+            ("includes/foo.php", FileStatus::Modified),
         ]);
-
-        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata]
-            .into_iter()
-            .collect();
-        let filtered = result.apply(&all_cats, &["assets".to_string()]);
-        assert_eq!(filtered.files.len(), 1);
-        assert_eq!(filtered.files[0].path, "includes/foo.php");
+        assert_eq!(
+            paths(&diff.filtered(&exclude(&["assets/"]))),
+            ["includes/foo.php"]
+        );
     }
 
     #[test]
-    fn apply_filters_exclude_glob() {
-        let result = make_test_result(vec![
-            ("src/a.php", FileCategory::Source, FileStatus::Modified),
-            ("src/b.js", FileCategory::Source, FileStatus::Modified),
+    fn exclude_glob_is_used_verbatim() {
+        let diff = changed(&[
+            ("src/a.php", FileStatus::Modified),
+            ("src/b.js", FileStatus::Modified),
+            ("b.js", FileStatus::Modified),
         ]);
-
-        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&all_cats, &["**/*.js".to_string()]);
-        assert_eq!(filtered.files.len(), 1);
-        assert_eq!(filtered.files[0].path, "src/a.php");
+        assert_eq!(
+            paths(&diff.filtered(&exclude(&["src/*.js"]))),
+            ["src/a.php", "b.js"]
+        );
     }
 
     #[test]
-    fn apply_exclude_trailing_slash() {
-        let result = make_test_result(vec![
-            (
-                "assets/js/app.js",
-                FileCategory::Source,
-                FileStatus::Modified,
-            ),
-            (
-                "includes/foo.php",
-                FileCategory::Source,
-                FileStatus::Modified,
-            ),
-        ]);
+    fn filtering_recalculates_summary_but_keeps_unchanged() {
+        let files = [
+            ("a.php", FileStatus::Added),
+            ("b.php", FileStatus::Modified),
+            ("readme.txt", FileStatus::Removed),
+            ("c.min.js", FileStatus::Modified),
+        ]
+        .map(|(path, status)| FileDiff::new(path, status, "", ""));
+        let diff = DirDiff::new(files.into(), SkippedDirs::default(), 7);
+        assert_eq!(diff.summary.modified, 2);
 
-        let all_cats: HashSet<FileCategory> = [FileCategory::Source, FileCategory::Metadata]
-            .into_iter()
-            .collect();
-        let filtered = result.apply(&all_cats, &["assets/".to_string()]);
-        assert_eq!(filtered.files.len(), 1);
-        assert_eq!(filtered.files[0].path, "includes/foo.php");
+        let summary = diff.filtered(&Filter::default()).summary;
+        assert_eq!(
+            (summary.added, summary.removed, summary.modified),
+            (1, 1, 1)
+        );
+        assert_eq!(summary.unchanged, 7);
+        assert_eq!(summary.by_category[&FileCategory::Source].added, 1);
+        assert_eq!(summary.by_category[&FileCategory::Source].modified, 1);
+        assert_eq!(summary.by_category[&FileCategory::Metadata].removed, 1);
+        assert!(!summary.by_category.contains_key(&FileCategory::Artifact));
     }
 
     #[test]
-    fn apply_exclude_nested_dir() {
-        let result = make_test_result(vec![
-            ("a/b/c.php", FileCategory::Source, FileStatus::Modified),
-            ("a/d.php", FileCategory::Source, FileStatus::Modified),
-            ("e.php", FileCategory::Source, FileStatus::Modified),
-        ]);
-
-        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&all_cats, &["a".to_string()]);
-        assert_eq!(filtered.files.len(), 1);
-        assert_eq!(filtered.files[0].path, "e.php");
+    fn patch_concatenates_file_diffs_in_path_order() {
+        let diff = diff_trees(
+            &[("b.php", "new b\n"), ("a.php", "new a\n")],
+            &[("b.php", "old b\n"), ("a.php", "old a\n")],
+            true,
+        );
+        assert_eq!(
+            diff.patch(),
+            "--- a/a.php\n+++ b/a.php\n@@ -1 +1 @@\n-old a\n+new a\n\
+             --- a/b.php\n+++ b/b.php\n@@ -1 +1 @@\n-old b\n+new b\n"
+        );
+        assert_eq!(diff.line_changes(), (2, 2));
     }
-
-    #[test]
-    fn apply_empty_exclude() {
-        let result = make_test_result(vec![
-            ("a.php", FileCategory::Source, FileStatus::Modified),
-            ("b.php", FileCategory::Source, FileStatus::Modified),
-        ]);
-
-        let all_cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&all_cats, &[]);
-        assert_eq!(filtered.files.len(), 2);
-    }
-
-    #[test]
-    fn apply_recalculates_summary() {
-        let result = make_test_result(vec![
-            ("a.php", FileCategory::Source, FileStatus::Added),
-            ("b.php", FileCategory::Source, FileStatus::Modified),
-            ("c.min.js", FileCategory::Artifact, FileStatus::Modified),
-        ]);
-
-        let source_only: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&source_only, &[]);
-        assert_eq!(filtered.summary.added, 1);
-        assert_eq!(filtered.summary.modified, 1);
-        assert_eq!(filtered.files.len(), 2);
-    }
-
-    #[test]
-    fn latest_version_preserved_through_filter() {
-        let mut result =
-            make_test_result(vec![("a.php", FileCategory::Source, FileStatus::Modified)]);
-        result.latest_version = Some("2.0".to_string());
-
-        let cats: HashSet<FileCategory> = HashSet::from([FileCategory::Source]);
-        let filtered = result.apply(&cats, &[]);
-        assert_eq!(filtered.latest_version, Some("2.0".to_string()));
-    }
-
-    // --- Filesystem-based tests ---
 
     #[test]
     fn diff_directories_identical() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert!(result.files.is_empty());
-        assert_eq!(result.summary.unchanged, 1);
+        let diff = diff_trees(&[("a.php", "hello\n")], &[("a.php", "hello\n")], false);
+        assert!(diff.files.is_empty());
+        assert_eq!(diff.summary.unchanged, 1);
     }
 
     #[test]
     fn diff_directories_modified_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "modified\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "original\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert_eq!(result.summary.modified, 1);
-        assert_eq!(result.files.len(), 1);
-        assert_eq!(result.files[0].status, FileStatus::Modified);
-        assert!(result.files[0].insertions > 0);
-        assert!(result.files[0].deletions > 0);
+        let diff = diff_trees(
+            &[("a.php", "same\nmodified\n")],
+            &[("a.php", "same\noriginal\n")],
+            false,
+        );
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].status, FileStatus::Modified);
+        assert_eq!((diff.files[0].insertions, diff.files[0].deletions), (1, 1));
     }
 
     #[test]
     fn diff_directories_added_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello\n").unwrap();
-        std::fs::write(local.join("new.php"), "new file\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert_eq!(result.summary.added, 1);
-        assert_eq!(result.summary.unchanged, 1);
-        let added = result
-            .files
-            .iter()
-            .find(|f| f.status == FileStatus::Added)
-            .unwrap();
-        assert_eq!(added.path, "new.php");
+        let diff = diff_trees(
+            &[("a.php", "hello\n"), ("sub/new.php", "one\ntwo\n")],
+            &[("a.php", "hello\n")],
+            false,
+        );
+        assert_eq!(diff.summary.added, 1);
+        assert_eq!(diff.summary.unchanged, 1);
+        assert_eq!(paths(&diff), ["sub/new.php"]);
+        assert_eq!(diff.files[0].status, FileStatus::Added);
+        assert_eq!((diff.files[0].insertions, diff.files[0].deletions), (2, 0));
     }
 
     #[test]
     fn diff_directories_removed_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-        std::fs::write(upstream.join("old.php"), "removed\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert_eq!(result.summary.removed, 1);
-        let removed = result
-            .files
-            .iter()
-            .find(|f| f.status == FileStatus::Removed)
-            .unwrap();
-        assert_eq!(removed.path, "old.php");
+        let diff = diff_trees(
+            &[("a.php", "hello\n")],
+            &[("a.php", "hello\n"), ("old.php", "removed\n")],
+            false,
+        );
+        assert_eq!(diff.summary.removed, 1);
+        assert_eq!(paths(&diff), ["old.php"]);
+        assert_eq!(diff.files[0].status, FileStatus::Removed);
+        assert_eq!((diff.files[0].insertions, diff.files[0].deletions), (0, 1));
     }
 
     #[test]
-    fn diff_directories_skips_node_modules() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(local.join("node_modules/pkg")).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello\n").unwrap();
-        std::fs::write(local.join("node_modules/pkg/index.js"), "junk\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
+    fn diff_directories_reports_empty_added_file() {
+        let diff = diff_trees(&[("empty.php", "")], &[], false);
+        assert_eq!(paths(&diff), ["empty.php"]);
+        assert_eq!(diff.files[0].status, FileStatus::Added);
+    }
 
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert!(
-            result
-                .skipped_dirs
-                .local
-                .contains(&"node_modules".to_string())
+    #[test]
+    fn diff_directories_skips_dependency_dirs_at_any_depth() {
+        let diff = diff_trees(
+            &[
+                ("a.php", "hello\n"),
+                ("node_modules/pkg/index.js", "junk\n"),
+                ("vendor/lib/x.php", "vendor\n"),
+                ("src/external/y.php", "nested\n"),
+                ("vendor_custom/z.php", "kept\n"),
+            ],
+            &[("a.php", "hello\n"), ("vendor/lib/x.php", "upstream\n")],
+            false,
         );
-        assert!(
-            result
-                .files
-                .iter()
-                .all(|f| !f.path.contains("node_modules"))
-        );
+        assert_eq!(paths(&diff), ["vendor_custom/z.php"]);
+        assert_eq!(diff.skipped_dirs.local, ["node_modules", "vendor"]);
+        assert_eq!(diff.skipped_dirs.upstream, ["vendor"]);
     }
 
     #[test]
     fn diff_directories_whitespace_ignored_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello   \n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert_eq!(result.summary.unchanged, 1);
-        assert!(result.files.is_empty());
+        let diff = diff_trees(
+            &[("a.php", "hello   \r\nworld\r\n"), ("mac.php", "a\rb\r")],
+            &[("a.php", "hello\nworld\n"), ("mac.php", "a\nb\n")],
+            false,
+        );
+        assert_eq!(diff.summary.unchanged, 2);
+        assert!(diff.files.is_empty());
     }
 
     #[test]
     fn diff_directories_whitespace_strict() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello   \n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", true).unwrap();
-        assert_eq!(result.summary.modified, 1);
+        let diff = diff_trees(&[("a.php", "hello   \n")], &[("a.php", "hello\n")], true);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(
+            diff.files[0].diff_text,
+            "--- a/a.php\n+++ b/a.php\n@@ -1 +1 @@\n-hello\n+hello   \n"
+        );
     }
 
     #[test]
-    fn diff_directories_categorizes_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(&local).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("src.php"), "changed\n").unwrap();
-        std::fs::write(upstream.join("src.php"), "original\n").unwrap();
-        std::fs::write(local.join("app.min.js"), "changed\n").unwrap();
-        std::fs::write(upstream.join("app.min.js"), "original\n").unwrap();
-        std::fs::write(local.join("logo.png"), "changed\n").unwrap();
-        std::fs::write(upstream.join("logo.png"), "original\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert_eq!(result.summary.modified, 3);
-
-        let src = result.files.iter().find(|f| f.path == "src.php").unwrap();
-        assert_eq!(src.category, FileCategory::Source);
-
-        let min = result
-            .files
-            .iter()
-            .find(|f| f.path == "app.min.js")
-            .unwrap();
-        assert_eq!(min.category, FileCategory::Artifact);
-
-        let png = result.files.iter().find(|f| f.path == "logo.png").unwrap();
-        assert_eq!(png.category, FileCategory::Asset);
-    }
-
-    #[test]
-    fn diff_directories_skips_vendor_and_external() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("local");
-        let upstream = dir.path().join("upstream");
-        std::fs::create_dir_all(local.join("vendor/lib")).unwrap();
-        std::fs::create_dir_all(local.join("external/pkg")).unwrap();
-        std::fs::create_dir_all(&upstream).unwrap();
-        std::fs::write(local.join("a.php"), "hello\n").unwrap();
-        std::fs::write(local.join("vendor/lib/x.php"), "vendor\n").unwrap();
-        std::fs::write(local.join("external/pkg/y.php"), "ext\n").unwrap();
-        std::fs::write(upstream.join("a.php"), "hello\n").unwrap();
-
-        let result = diff_directories(&local, &upstream, "test", "1.0", false).unwrap();
-        assert!(result.skipped_dirs.local.contains(&"vendor".to_string()));
-        assert!(result.skipped_dirs.local.contains(&"external".to_string()));
-        assert!(result.files.iter().all(|f| !f.path.contains("vendor")));
-    }
-
-    // --- Helpers ---
-
-    fn make_test_result(files: Vec<(&str, FileCategory, FileStatus)>) -> DiffResult {
-        DiffResult {
-            plugin_slug: "test".to_string(),
-            latest_version: None,
-            plugin_version: "1.0".to_string(),
-            files: files
-                .into_iter()
-                .map(|(path, category, status)| FileDiff {
-                    path: path.to_string(),
-                    status,
-                    category,
-                    insertions: 0,
-                    deletions: 0,
-                    diff_text: String::new(),
-                })
-                .collect(),
-            skipped_dirs: SkippedDirs {
-                local: vec![],
-                upstream: vec![],
-            },
-            summary: DiffSummary {
-                added: 0,
-                removed: 0,
-                modified: 0,
-                unchanged: 0,
-                by_category: BTreeMap::new(),
-            },
-        }
+    fn diff_directories_fails_on_missing_directory() {
+        let local = tree(&[("a.php", "hello\n")]);
+        let missing = local.path().join("does-not-exist");
+        assert!(diff_directories(local.path(), &missing, false).is_err());
     }
 }

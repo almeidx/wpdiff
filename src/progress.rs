@@ -1,37 +1,25 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-static SUPPRESS: AtomicBool = AtomicBool::new(false);
-
-pub fn suppress(yes: bool) {
-    SUPPRESS.store(yes, Ordering::Relaxed);
-}
-
-fn is_suppressed() -> bool {
-    SUPPRESS.load(Ordering::Relaxed)
-}
-
 pub fn bar(len: u64, template: &str) -> ProgressBar {
-    if is_suppressed() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(len);
-    pb.set_style(
-        ProgressStyle::with_template(template)
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb
+    show(ProgressBar::new(len), style(template).progress_chars("█▓░"))
 }
 
 pub fn spinner(template: &str) -> ProgressBar {
-    if is_suppressed() {
+    show(ProgressBar::new_spinner(), style(template))
+}
+
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).expect("progress templates are valid literals")
+}
+
+/// Bars started from rayon workers would redraw over each other, so only
+/// progress created outside the pool is drawn.
+fn show(pb: ProgressBar, style: ProgressStyle) -> ProgressBar {
+    if rayon::current_thread_index().is_some() {
         return ProgressBar::hidden();
     }
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template(template).unwrap());
+    pb.set_style(style);
     pb.enable_steady_tick(Duration::from_millis(100));
     pb
 }
@@ -40,27 +28,17 @@ pub fn spinner(template: &str) -> ProgressBar {
 mod tests {
     use super::*;
 
+    // `is_hidden()` is also true whenever stderr is not a terminal, so the
+    // test tells a real bar from a hidden one by its length instead.
     #[test]
-    fn suppress_returns_hidden_bar() {
-        suppress(true);
-        let pb = bar(100, "{pos}/{len}");
-        assert!(pb.is_hidden());
-        suppress(false);
-    }
+    fn only_progress_from_parallel_workers_is_hidden() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let from_worker = pool.install(|| bar(100, "{pos}/{len}"));
 
-    #[test]
-    fn suppress_returns_hidden_spinner() {
-        suppress(true);
-        let pb = spinner("{spinner} working...");
-        assert!(pb.is_hidden());
-        suppress(false);
-    }
-
-    #[test]
-    fn suppress_toggle() {
-        suppress(true);
-        assert!(is_suppressed());
-        suppress(false);
-        assert!(!is_suppressed());
+        assert_eq!(from_worker.length(), None);
+        assert_eq!(bar(100, "{pos}/{len}").length(), Some(100));
     }
 }

@@ -6,14 +6,16 @@ mod source;
 mod upgrade;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use colored::Colorize;
-use diff::FileCategory;
+use diff::{DirDiff, Filter};
 use log::{LevelFilter, debug, info, warn};
-use std::collections::HashSet;
+use output::Report;
+use plugin::PluginMeta;
+use source::WpOrg;
 use std::fs;
-use std::io::{self, Write as _};
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -25,95 +27,14 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    // Options of the default diff, which subcommands inherit
+    // (see `Command::inherit`).
     #[command(flatten)]
-    common: CommonArgs,
-
-    #[command(flatten)]
-    filter: FilterArgs,
-}
-
-impl Cli {
-    fn logging_args(&self) -> (u8, bool) {
-        match &self.command {
-            Some(Command::Summary { common, .. } | Command::Export { common, .. }) => (
-                common.verbose.max(self.common.verbose),
-                common.quiet || self.common.quiet,
-            ),
-            Some(Command::Versions { .. } | Command::Upgrade { .. }) | None => {
-                (self.common.verbose, self.common.quiet)
-            }
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Show a summary of changes (no diffs)
-    Summary {
-        #[command(flatten)]
-        common: CommonArgs,
-        #[command(flatten)]
-        filter: FilterArgs,
-    },
-    /// Export changes as a .patch file
-    Export {
-        /// Output file path (default: <slug>-<version>.patch)
-        #[arg(short, long)]
-        output: Option<String>,
-        #[command(flatten)]
-        common: CommonArgs,
-        #[command(flatten)]
-        filter: FilterArgs,
-    },
-    /// List available versions from wordpress.org
-    Versions {
-        /// Plugin slug or path
-        plugin: Option<String>,
-        /// `WordPress` root directory
-        #[arg(short = 'C', long = "dir")]
-        dir: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Upgrade plugin and attempt to reapply local customizations
-    Upgrade {
-        /// Plugin slug or path
-        plugin: Option<String>,
-        /// `WordPress` root directory
-        #[arg(short = 'C', long = "dir")]
-        dir: Option<String>,
-        /// Target version (default: latest)
-        #[arg(long)]
-        to: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
-        /// Test if upgrade + patch would succeed without modifying anything
-        #[arg(long)]
-        dry_run: bool,
-        /// Include whitespace and line ending changes
-        #[arg(long)]
-        whitespace: bool,
-    },
-}
-
-#[derive(Parser, Clone)]
-struct CommonArgs {
-    /// Plugin slug or path to plugin directory
-    plugin: Option<String>,
-
-    /// Scan all plugins in a `WordPress` installation
-    #[arg(long)]
-    all: bool,
+    diff: DiffArgs,
 
     /// `WordPress` root directory
-    #[arg(short = 'C', long = "dir")]
-    dir: Option<String>,
-
-    /// Include whitespace and line ending changes
-    #[arg(long)]
-    whitespace: bool,
+    #[arg(short = 'C', long = "dir", global = true)]
+    dir: Option<PathBuf>,
 
     /// Increase verbosity (-v info, -vv debug, -vvv trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -124,42 +45,28 @@ struct CommonArgs {
     quiet: bool,
 }
 
-impl CommonArgs {
-    fn with_globals(&self, global: &Self) -> Self {
-        Self {
-            plugin: self.plugin.clone().or_else(|| global.plugin.clone()),
-            all: self.all || global.all,
-            dir: self.dir.clone().or_else(|| global.dir.clone()),
-            whitespace: self.whitespace || global.whitespace,
-            verbose: self.verbose.max(global.verbose),
-            quiet: self.quiet || global.quiet,
-        }
-    }
+#[derive(Args)]
+struct DiffArgs {
+    /// Plugin slug or path to plugin directory
+    plugin: Option<String>,
 
-    fn command_plugin<'a>(&'a self, plugin: Option<&'a str>) -> Option<&'a str> {
-        plugin.or(self.plugin.as_deref())
-    }
+    /// Scan all plugins in a `WordPress` installation
+    #[arg(long)]
+    all: bool,
 
-    fn command_base_dir<'a>(&'a self, dir: Option<&'a str>) -> Option<&'a Path> {
-        dir.or(self.dir.as_deref()).map(Path::new)
-    }
+    /// Include whitespace and line ending changes
+    #[arg(long)]
+    whitespace: bool,
 
-    const fn command_whitespace(&self, whitespace: bool) -> bool {
-        whitespace || self.whitespace
-    }
+    #[command(flatten)]
+    filter: FilterArgs,
 
-    fn base_dir(&self) -> Option<&Path> {
-        self.dir.as_deref().map(Path::new)
-    }
-
-    fn require_plugin(&self) -> Result<&str> {
-        self.plugin
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Provide a plugin slug or path, or use --all"))
-    }
+    /// Output as JSON instead of terminal format
+    #[arg(long)]
+    json: bool,
 }
 
-#[derive(Parser, Clone)]
+#[derive(Args)]
 struct FilterArgs {
     /// Include build artifacts (.min.js, vendor/, etc.)
     #[arg(long)]
@@ -176,52 +83,125 @@ struct FilterArgs {
     /// Exclude files matching glob patterns (repeatable)
     #[arg(short = 'x', long = "exclude", value_name = "GLOB")]
     exclude: Vec<String>,
+}
 
-    /// Output as JSON instead of terminal format
-    #[arg(long)]
-    json: bool,
+#[derive(Subcommand)]
+enum Command {
+    /// Show a summary of changes (no diffs)
+    Summary(DiffArgs),
+    /// Export changes as a .patch file
+    Export {
+        /// Plugin slug or path to plugin directory
+        plugin: Option<String>,
+        /// Output file path (default: <slug>-<version>.patch)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Include whitespace and line ending changes
+        #[arg(long)]
+        whitespace: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// List available versions from wordpress.org
+    Versions {
+        /// Plugin slug or path
+        plugin: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Upgrade plugin and attempt to reapply local customizations
+    Upgrade {
+        /// Plugin slug or path
+        plugin: Option<String>,
+        /// Target version (default: latest)
+        #[arg(long)]
+        to: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+        /// Test if upgrade + patch would succeed without modifying anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Include whitespace and line ending changes
+        #[arg(long)]
+        whitespace: bool,
+    },
+}
+
+impl DiffArgs {
+    fn or(self, outer: Self) -> Self {
+        Self {
+            plugin: self.plugin.or(outer.plugin),
+            all: self.all || outer.all,
+            whitespace: self.whitespace || outer.whitespace,
+            filter: self.filter.or(outer.filter),
+            json: self.json || outer.json,
+        }
+    }
 }
 
 impl FilterArgs {
-    fn with_globals(&self, global: &Self) -> Self {
-        let mut exclude = global.exclude.clone();
-        exclude.extend(self.exclude.iter().cloned());
-
+    fn or(self, outer: Self) -> Self {
         Self {
-            include_artifacts: self.include_artifacts || global.include_artifacts,
-            include_assets: self.include_assets || global.include_assets,
-            include_all: self.include_all || global.include_all,
-            exclude,
-            json: self.json || global.json,
+            include_artifacts: self.include_artifacts || outer.include_artifacts,
+            include_assets: self.include_assets || outer.include_assets,
+            include_all: self.include_all || outer.include_all,
+            exclude: [outer.exclude, self.exclude].concat(),
         }
     }
 
-    fn included_categories(&self) -> HashSet<FileCategory> {
-        let mut cats = HashSet::new();
-        cats.insert(FileCategory::Source);
-        cats.insert(FileCategory::Metadata);
-
-        if self.include_all || self.include_artifacts {
-            cats.insert(FileCategory::Artifact);
-        }
-        if self.include_all || self.include_assets {
-            cats.insert(FileCategory::Asset);
-        }
-
-        cats
+    fn to_filter(&self) -> Filter {
+        Filter::new(
+            self.include_all || self.include_artifacts,
+            self.include_all || self.include_assets,
+            &self.exclude,
+        )
     }
+}
 
-    fn apply_filters(&self, result: &diff::DiffResult) -> diff::DiffResult {
-        result.apply(&self.included_categories(), &self.exclude)
+impl Command {
+    /// Options given before the subcommand name also apply to it: flags and
+    /// `-x` patterns combine, a plugin named after the subcommand wins.
+    fn inherit(self, outer: DiffArgs) -> Self {
+        match self {
+            Self::Summary(args) => Self::Summary(args.or(outer)),
+            Self::Export {
+                plugin,
+                output,
+                whitespace,
+                filter,
+            } => Self::Export {
+                plugin: plugin.or(outer.plugin),
+                output,
+                whitespace: whitespace || outer.whitespace,
+                filter: filter.or(outer.filter),
+            },
+            Self::Versions { plugin, json } => Self::Versions {
+                plugin: plugin.or(outer.plugin),
+                json: json || outer.json,
+            },
+            Self::Upgrade {
+                plugin,
+                to,
+                yes,
+                dry_run,
+                whitespace,
+            } => Self::Upgrade {
+                plugin: plugin.or(outer.plugin),
+                to,
+                yes,
+                dry_run,
+                whitespace: whitespace || outer.whitespace,
+            },
+        }
     }
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let (verbose, quiet) = cli.logging_args();
-
-    init_logger(verbose, quiet);
+    init_logger(cli.verbose, cli.quiet);
 
     if let Err(e) = run(cli) {
         log::error!("{e:#}");
@@ -249,106 +229,264 @@ fn init_logger(verbose: u8, quiet: bool) {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let Cli {
-        command,
-        common: global_common,
-        filter: global_filter,
-    } = cli;
+    let dir = cli.dir.as_deref();
 
-    match command {
-        None => {
-            if global_common.plugin.is_none() && !global_common.all {
-                Cli::parse_from(["wpdiff", "--help"]);
-                return Ok(());
-            }
-            render_command(&global_common, &global_filter, &RenderMode::Diff)
+    let Some(command) = cli.command else {
+        if cli.diff.plugin.is_none() && !cli.diff.all {
+            Cli::command().print_help()?;
+            return Ok(());
         }
-        Some(Command::Summary { common, filter }) => {
-            let common = common.with_globals(&global_common);
-            let filter = filter.with_globals(&global_filter);
-            render_command(&common, &filter, &RenderMode::Summary)
-        }
-        Some(Command::Export {
-            output,
-            common,
-            filter,
-        }) => {
-            let common = common.with_globals(&global_common);
-            let filter = filter.with_globals(&global_filter);
-            cmd_export(&common, &filter, output.as_deref())
-        }
-        Some(Command::Versions { plugin, dir, json }) => {
-            let plugin = global_common.command_plugin(plugin.as_deref());
-            let base_dir = global_common.command_base_dir(dir.as_deref());
-            cmd_versions(plugin, base_dir, json || global_filter.json)
-        }
-        Some(Command::Upgrade {
+        return cmd_diff(&cli.diff, dir, Format::Diff);
+    };
+
+    match command.inherit(cli.diff) {
+        Command::Summary(args) => cmd_diff(&args, dir, Format::Summary),
+        Command::Export {
             plugin,
-            dir,
+            output,
+            whitespace,
+            filter,
+        } => {
+            let plugin = plugin.context("Provide a plugin slug or path to export")?;
+            cmd_export(
+                &plugin,
+                dir,
+                whitespace,
+                &filter.to_filter(),
+                output.as_deref(),
+            )
+        }
+        Command::Versions { plugin, json } => {
+            let plugin = plugin.context("Provide a plugin slug")?;
+            cmd_versions(&plugin, dir, json)
+        }
+        Command::Upgrade {
+            plugin,
             to,
             yes,
             dry_run,
             whitespace,
-        }) => upgrade::run(
-            global_common.command_plugin(plugin.as_deref()),
-            global_common.command_base_dir(dir.as_deref()),
-            to.as_deref(),
-            yes,
-            dry_run,
-            global_common.command_whitespace(whitespace),
-        ),
+        } => {
+            let plugin = plugin.context("Provide a plugin slug or path to upgrade")?;
+            let meta = plugin::locate(&plugin, dir)?;
+            upgrade::run(
+                &meta,
+                &upgrade::Options {
+                    target_version: to.as_deref(),
+                    yes,
+                    dry_run,
+                    strict_whitespace: whitespace,
+                },
+            )
+        }
     }
 }
 
-enum RenderMode {
+#[derive(Clone, Copy)]
+enum Format {
     Diff,
     Summary,
+    Json,
 }
 
-fn render_output(
-    result: &diff::DiffResult,
-    mode: &RenderMode,
-    json: bool,
-    is_all: bool,
-) -> Result<()> {
+fn render(report: &Report, format: Format, out: &mut impl Write) -> Result<()> {
+    match format {
+        Format::Diff => output::render_terminal(report, out),
+        Format::Summary => output::render_summary(report, out),
+        Format::Json => output::render_json(report, out),
+    }
+}
+
+fn cmd_diff(args: &DiffArgs, dir: Option<&Path>, view: Format) -> Result<()> {
+    let format = if args.json { Format::Json } else { view };
+    let filter = args.filter.to_filter();
+
+    if !args.all {
+        let plugin = args
+            .plugin
+            .as_deref()
+            .context("Provide a plugin slug or path, or use --all")?;
+        let meta = plugin::locate(plugin, dir)?;
+        let report = compare(&WpOrg::new()?, &meta, args.whitespace, &filter)?;
+        return render(&report, format, &mut io::stdout().lock());
+    }
+
+    let scan = scan_all(dir, args.whitespace, &filter)?;
     let mut out = io::stdout().lock();
-    if json {
-        output::render_json(result, &mut out)?;
-    } else {
-        match (mode, is_all) {
-            (RenderMode::Diff, _) => output::render_terminal(result, &mut out)?,
-            (RenderMode::Summary, true) => output::render_summary_compact(result, &mut out)?,
-            (RenderMode::Summary, false) => output::render_summary(result, &mut out)?,
+
+    match format {
+        Format::Summary => {
+            output::render_summary_table(
+                &scan.changed,
+                scan.clean,
+                scan.unmatched.len(),
+                &mut out,
+            )?;
         }
+        Format::Diff | Format::Json if scan.changed.is_empty() && scan.unmatched.is_empty() => {
+            info!("All plugins match their upstream versions.");
+        }
+        Format::Diff | Format::Json => {
+            for report in &scan.changed {
+                render(report, format, &mut out)?;
+            }
+            if scan.clean > 0 || !scan.unmatched.is_empty() {
+                output::render_scan_footer(
+                    scan.changed.len(),
+                    scan.clean,
+                    scan.unmatched.len(),
+                    &mut out,
+                )?;
+            }
+        }
+    }
+
+    for (slug, reason) in &scan.unmatched {
+        warn!("{slug} - {reason:#}");
     }
     Ok(())
 }
 
-fn render_command(common: &CommonArgs, filter: &FilterArgs, mode: &RenderMode) -> Result<()> {
-    if common.all {
-        let is_summary = matches!(mode, RenderMode::Summary);
-        return run_all(common, filter, is_summary, |filtered| {
-            render_output(filtered, mode, filter.json, true)
-        });
-    }
+/// Diffs an installed plugin against the upstream package `WpOrg::download`
+/// finds for its version.
+fn diff_installed(
+    wporg: &WpOrg,
+    meta: &PluginMeta,
+    strict_whitespace: bool,
+    filter: &Filter,
+) -> Result<DirDiff> {
+    info!(
+        "Comparing {} v{} against upstream...",
+        meta.name, meta.version
+    );
+    debug!("Plugin directory: {}", meta.dir.display());
 
-    let result = resolve_and_diff(common)?;
-    let filtered = filter.apply_filters(&result);
-    render_output(&filtered, mode, filter.json, false)
+    let upstream = wporg.download(&meta.slug, &meta.version)?;
+    debug!("Upstream extracted to: {}", upstream.path().display());
+
+    Ok(diff::diff_directories(&meta.dir, upstream.path(), strict_whitespace)?.filtered(filter))
 }
 
-fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -> Result<()> {
-    let plugin_arg = plugin_arg.ok_or_else(|| anyhow::anyhow!("Provide a plugin slug"))?;
-
-    let slug = resolve_slug(plugin_arg, base_dir);
-
-    let installed_version = plugin::resolve_plugin_path(plugin_arg, base_dir)
+fn compare(
+    wporg: &WpOrg,
+    meta: &PluginMeta,
+    strict_whitespace: bool,
+    filter: &Filter,
+) -> Result<Report> {
+    let diff = diff_installed(wporg, meta, strict_whitespace, filter)?;
+    // Without the lookup the report only lacks its "latest version" hint.
+    let latest_version = wporg
+        .plugin_info(&meta.slug)
         .ok()
-        .and_then(|p| plugin::discover_plugin(&p).ok())
-        .map(|m| m.version);
+        .map(|info| info.latest_version);
+
+    Ok(Report {
+        plugin_slug: meta.slug.clone(),
+        plugin_version: meta.version.clone(),
+        latest_version,
+        diff,
+    })
+}
+
+/// The outcome of comparing every plugin of an installation, ordered by slug.
+#[derive(Default)]
+struct Scan {
+    changed: Vec<Report>,
+    /// Number of plugins identical to upstream after filtering.
+    clean: usize,
+    /// Plugins that could not be compared, and why.
+    unmatched: Vec<(String, anyhow::Error)>,
+}
+
+fn scan_all(dir: Option<&Path>, strict_whitespace: bool, filter: &Filter) -> Result<Scan> {
+    use rayon::prelude::*;
+
+    let base = dir.unwrap_or_else(|| Path::new("."));
+    debug!("Scanning all plugins in {}", base.display());
+
+    let mut plugins: Vec<PluginMeta> = plugin::discover_all(base)?
+        .into_iter()
+        .filter_map(|discovered| discovered.inspect_err(|e| warn!("{e:#}")).ok())
+        .collect();
+    plugins.sort_by_key(|meta| meta.slug.to_lowercase());
+
+    debug!("Found {} plugins", plugins.len());
+
+    let wporg = WpOrg::new()?;
+    let progress = progress::bar(
+        plugins.len() as u64,
+        "  {spinner:.green} Scanning [{bar:30.cyan/dim}] {pos}/{len} plugins",
+    );
+    let results: Vec<Result<Report>> = plugins
+        .par_iter()
+        .map(|meta| {
+            let result = compare(&wporg, meta, strict_whitespace, filter);
+            progress.inc(1);
+            result
+        })
+        .collect();
+    progress.finish_and_clear();
+
+    let mut scan = Scan::default();
+    for (meta, result) in plugins.into_iter().zip(results) {
+        match result {
+            Ok(report) if report.diff.files.is_empty() => {
+                scan.clean += 1;
+                debug!("{}: no differences", meta.slug);
+            }
+            Ok(report) => scan.changed.push(report),
+            Err(e) => scan.unmatched.push((meta.slug, e)),
+        }
+    }
+    Ok(scan)
+}
+
+fn cmd_export(
+    plugin: &str,
+    dir: Option<&Path>,
+    strict_whitespace: bool,
+    filter: &Filter,
+    output_path: Option<&str>,
+) -> Result<()> {
+    let meta = plugin::locate(plugin, dir)?;
+    let diff = diff_installed(&WpOrg::new()?, &meta, strict_whitespace, filter)?;
+
+    if diff.files.is_empty() {
+        bail!("No differences to export");
+    }
+
+    let path = output_path.map_or_else(
+        || format!("{}-{}.patch", meta.slug, meta.version),
+        str::to_string,
+    );
+    fs::write(&path, diff.patch())
+        .with_context(|| format!("Failed to create patch file {path}"))?;
+
+    info!("Patch exported to {path}");
+    Ok(())
+}
+
+fn cmd_versions(plugin: &str, dir: Option<&Path>, json: bool) -> Result<()> {
+    // The plugin does not have to be installed: an argument that resolves to
+    // nothing on disk is taken as a wordpress.org slug.
+    let installed_dir = plugin::resolve_plugin_path(plugin, dir).ok();
+    let slug = installed_dir
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or_else(
+            || {
+                let trimmed = plugin.trim_end_matches('/');
+                let (_, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+                name.to_string()
+            },
+            |name| name.to_string_lossy().into_owned(),
+        );
+    let installed_version = installed_dir
+        .and_then(|path| plugin::discover_plugin(&path).ok())
+        .map(|meta| meta.version);
 
     info!("Fetching versions for {slug}...");
-    let info = source::fetch_plugin_versions(&slug)?;
+    let info = WpOrg::new()?.plugin_info(&slug)?;
 
     if json {
         let json = serde_json::json!({
@@ -364,7 +502,7 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
 
     println!("{} {}", info.name.bold(), format!("({slug})").dimmed());
 
-    if let Some(ref installed) = installed_version {
+    if let Some(installed) = &installed_version {
         println!("  Installed: {}", format!("v{installed}").yellow().bold());
     }
     println!(
@@ -383,246 +521,28 @@ fn cmd_versions(plugin_arg: Option<&str>, base_dir: Option<&Path>, json: bool) -
     }
 
     for version in &info.versions[start..] {
-        let is_installed = installed_version.as_deref() == Some(version.as_str());
+        let is_installed = installed_version.as_ref() == Some(version);
         let is_latest = version == &info.latest_version;
 
-        let marker = if is_installed && is_latest {
-            format!("{}", "◀ installed, latest".green())
-        } else if is_installed {
-            format!("{}", "◀ installed".yellow())
+        let marker = match (is_installed, is_latest) {
+            (true, true) => "◀ installed, latest".green(),
+            (true, false) => "◀ installed".yellow(),
+            (false, true) => "◀ latest".green(),
+            (false, false) => "".normal(),
+        };
+        let label = format!("v{version}");
+        let label = if is_installed {
+            label.yellow().bold()
         } else if is_latest {
-            format!("{}", "◀ latest".green())
+            label.green()
         } else {
-            String::new()
+            label.normal()
         };
 
-        let ver_display = if is_installed {
-            format!("v{version}").yellow().bold().to_string()
-        } else if is_latest {
-            format!("v{version}").green().to_string()
-        } else {
-            format!("v{version}")
-        };
-
-        println!("    {ver_display} {marker}");
+        println!("    {label} {marker}");
     }
 
     println!("\n  {total} versions total");
-
-    Ok(())
-}
-
-fn resolve_slug(plugin_arg: &str, base_dir: Option<&Path>) -> String {
-    plugin::resolve_plugin_path(plugin_arg, base_dir).map_or_else(
-        |_| {
-            plugin_arg
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(plugin_arg)
-                .to_string()
-        },
-        |path| {
-            path.file_name().map_or_else(
-                || plugin_arg.to_string(),
-                |n| n.to_string_lossy().to_string(),
-            )
-        },
-    )
-}
-
-fn cmd_export(common: &CommonArgs, filter: &FilterArgs, output_path: Option<&str>) -> Result<()> {
-    let result = resolve_and_diff(common)?;
-    let filtered = filter.apply_filters(&result);
-
-    if filtered.files.is_empty() {
-        bail!("No differences to export");
-    }
-
-    let path = match output_path {
-        Some(p) => p.to_string(),
-        None => format!("{}-{}.patch", filtered.plugin_slug, filtered.plugin_version),
-    };
-
-    let file =
-        fs::File::create(&path).with_context(|| format!("Failed to create patch file {path}"))?;
-    let mut writer = io::BufWriter::new(file);
-    output::render_unified(&filtered, &mut writer)?;
-
-    info!("Patch exported to {path}");
-    Ok(())
-}
-
-fn resolve_and_diff(common: &CommonArgs) -> Result<diff::DiffResult> {
-    let plugin_arg = common.require_plugin()?;
-
-    debug!("Resolving plugin: {plugin_arg}");
-    let plugin_path = plugin::resolve_plugin_path(plugin_arg, common.base_dir())?;
-    let mut result = diff_single_plugin(&plugin_path, common.whitespace)?;
-    result.latest_version = source::fetch_plugin_versions(&result.plugin_slug)
-        .ok()
-        .map(|info| info.latest_version);
-    Ok(result)
-}
-
-fn diff_single_plugin(plugin_path: &Path, strict_whitespace: bool) -> Result<diff::DiffResult> {
-    let registry = source::Registry::new();
-    diff_plugin_with_registry(&registry, plugin_path, strict_whitespace)
-}
-
-fn diff_plugin_with_registry(
-    registry: &source::Registry,
-    plugin_path: &Path,
-    strict_whitespace: bool,
-) -> Result<diff::DiffResult> {
-    let meta = plugin::discover_plugin(plugin_path)?;
-
-    info!(
-        "Comparing {} v{} against upstream...",
-        meta.name, meta.version
-    );
-    debug!("Plugin directory: {}", meta.dir.display());
-    debug!("Main file: {}", meta.main_file.display());
-
-    let upstream = registry.fetch(&meta, None)?;
-
-    debug!("Upstream extracted to: {}", upstream.path.display());
-
-    diff::diff_directories(
-        &meta.dir,
-        &upstream.path,
-        &meta.slug,
-        &meta.version,
-        strict_whitespace,
-    )
-}
-
-fn run_all(
-    common: &CommonArgs,
-    filter: &FilterArgs,
-    is_summary: bool,
-    render: impl Fn(&diff::DiffResult) -> anyhow::Result<()>,
-) -> Result<()> {
-    use rayon::prelude::*;
-
-    let base = common.dir.as_deref().unwrap_or(".");
-    debug!("Scanning all plugins in {base}");
-
-    let discovered = plugin::discover_all(Path::new(base))?;
-
-    let plugins: Vec<plugin::PluginMeta> = discovered
-        .into_iter()
-        .filter_map(|r| match r {
-            Ok(meta) => Some(meta),
-            Err(e) => {
-                warn!("{e:#}");
-                None
-            }
-        })
-        .collect();
-
-    debug!("Found {} plugins", plugins.len());
-
-    let whitespace = common.whitespace;
-    let registry = source::Registry::new();
-
-    let overall = progress::bar(
-        plugins.len() as u64,
-        "  {spinner:.green} Scanning [{bar:30.cyan/dim}] {pos}/{len} plugins",
-    );
-    progress::suppress(true);
-
-    let results: Vec<(String, Result<diff::DiffResult>)> = plugins
-        .par_iter()
-        .map(|meta| {
-            let result = diff_plugin_with_registry(&registry, &meta.dir, whitespace);
-            overall.inc(1);
-            (meta.slug.clone(), result)
-        })
-        .collect();
-
-    progress::suppress(false);
-    overall.finish_and_clear();
-
-    let version_pb = progress::bar(
-        results.len() as u64,
-        "  {spinner:.green} Checking versions [{bar:30.cyan/dim}] {pos}/{len}",
-    );
-    progress::suppress(true);
-
-    let results: Vec<(String, Result<diff::DiffResult>)> = results
-        .into_par_iter()
-        .map(|(slug, result)| {
-            let result = result.map(|mut r| {
-                r.latest_version = source::fetch_plugin_versions(&slug)
-                    .ok()
-                    .map(|info| info.latest_version);
-                r
-            });
-            version_pb.inc(1);
-            (slug, result)
-        })
-        .collect();
-
-    progress::suppress(false);
-    version_pb.finish_and_clear();
-
-    let mut sorted: Vec<(String, Result<diff::DiffResult>)> = results;
-    sorted.sort_by_key(|(slug, _)| slug.to_lowercase());
-
-    let mut diffs = Vec::new();
-    let mut clean_count = 0usize;
-    let mut unmatched = Vec::new();
-
-    for (slug, result) in sorted {
-        match result {
-            Ok(diff_result) => {
-                let filtered = filter.apply_filters(&diff_result);
-                if filtered.files.is_empty() {
-                    clean_count += 1;
-                    debug!("{slug}: no differences");
-                } else {
-                    diffs.push(filtered);
-                }
-            }
-            Err(e) => {
-                unmatched.push((slug, format!("{e:#}")));
-            }
-        }
-    }
-
-    if is_summary && !filter.json {
-        output::render_summary_table(
-            &diffs,
-            clean_count,
-            unmatched.len(),
-            &mut io::stdout().lock(),
-        )?;
-    } else if diffs.is_empty() && unmatched.is_empty() {
-        info!("All plugins match their upstream versions.");
-        return Ok(());
-    } else {
-        for diff in &diffs {
-            render(diff)?;
-        }
-        if clean_count > 0 || !unmatched.is_empty() {
-            let mut out = io::stdout().lock();
-            writeln!(out)?;
-            writeln!(
-                out,
-                "{} changed, {} unchanged, {} unmatched",
-                diffs.len(),
-                clean_count,
-                unmatched.len()
-            )?;
-        }
-    }
-
-    if !unmatched.is_empty() {
-        for (slug, reason) in &unmatched {
-            warn!("{slug} - {reason}");
-        }
-    }
 
     Ok(())
 }
@@ -631,98 +551,132 @@ fn run_all(
 mod tests {
     use super::*;
 
-    #[test]
-    fn summary_uses_dir_before_subcommand() {
-        let cli =
-            Cli::try_parse_from(["wpdiff", "-C", "/tmp/wordpress", "summary", "--all"]).unwrap();
-        let Cli {
-            command,
-            common: global_common,
-            ..
-        } = cli;
-        let Some(Command::Summary { common, .. }) = command else {
-            panic!("expected summary command");
-        };
-        let common = common.with_globals(&global_common);
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from([&["wpdiff"][..], args].concat()).unwrap()
+    }
 
-        assert_eq!(common.dir.as_deref(), Some("/tmp/wordpress"));
-        assert!(common.all);
+    fn command(args: &[&str]) -> Command {
+        let cli = parse(args);
+        cli.command.expect("a subcommand").inherit(cli.diff)
     }
 
     #[test]
-    fn versions_uses_dir_before_subcommand() {
-        let cli =
-            Cli::try_parse_from(["wpdiff", "-C", "/tmp/wordpress", "versions", "akismet"]).unwrap();
-        let Cli {
-            command,
-            common: global_common,
-            ..
-        } = cli;
-        let Some(Command::Versions { dir, .. }) = command else {
-            panic!("expected versions command");
-        };
-
+    fn dir_applies_on_either_side_of_the_subcommand() {
+        let wordpress = Some(PathBuf::from("/tmp/wordpress"));
         assert_eq!(
-            global_common.command_base_dir(dir.as_deref()),
-            Some(Path::new("/tmp/wordpress"))
+            parse(&["-C", "/tmp/wordpress", "summary", "--all"]).dir,
+            wordpress
+        );
+        assert_eq!(
+            parse(&["summary", "--all", "-C", "/tmp/wordpress"]).dir,
+            wordpress
+        );
+        assert_eq!(
+            parse(&["versions", "akismet", "-C", "/tmp/wordpress"]).dir,
+            wordpress
         );
     }
 
     #[test]
-    fn versions_prefers_dir_after_subcommand() {
-        let cli = Cli::try_parse_from([
-            "wpdiff",
+    fn dir_after_the_subcommand_wins() {
+        let cli = parse(&[
             "-C",
             "/tmp/global",
             "versions",
             "-C",
             "/tmp/command",
             "akismet",
-        ])
-        .unwrap();
-        let Cli {
-            command,
-            common: global_common,
-            ..
-        } = cli;
-        let Some(Command::Versions { dir, .. }) = command else {
-            panic!("expected versions command");
-        };
-
-        assert_eq!(
-            global_common.command_base_dir(dir.as_deref()),
-            Some(Path::new("/tmp/command"))
-        );
+        ]);
+        assert_eq!(cli.dir, Some(PathBuf::from("/tmp/command")));
     }
 
     #[test]
-    fn upgrade_uses_whitespace_before_subcommand() {
-        let cli = Cli::try_parse_from([
-            "wpdiff",
-            "-C",
-            "/tmp/wordpress",
+    fn verbosity_applies_on_either_side_of_the_subcommand() {
+        assert_eq!(parse(&["-vv", "upgrade", "akismet"]).verbose, 2);
+        assert_eq!(parse(&["summary", "akismet", "-vv"]).verbose, 2);
+        assert!(parse(&["export", "akismet", "-q"]).quiet);
+    }
+
+    #[test]
+    fn summary_inherits_options_given_before_it() {
+        let Command::Summary(args) = command(&[
+            "--all",
             "--whitespace",
-            "upgrade",
-            "akismet",
-            "--dry-run",
-        ])
-        .unwrap();
-        let Cli {
-            command,
-            common: global_common,
+            "--json",
+            "--include-assets",
+            "-x",
+            "outer",
+            "summary",
+            "-x",
+            "inner",
+        ]) else {
+            panic!("expected summary command");
+        };
+
+        assert!(args.all && args.whitespace && args.json);
+        assert!(args.filter.include_assets && !args.filter.include_artifacts);
+        assert_eq!(args.filter.exclude, ["outer", "inner"]);
+    }
+
+    #[test]
+    fn plugin_may_precede_the_subcommand_but_the_one_after_wins() {
+        let Command::Summary(before) = command(&["akismet", "summary"]) else {
+            panic!("expected summary command");
+        };
+        assert_eq!(before.plugin.as_deref(), Some("akismet"));
+
+        let Command::Versions { plugin, .. } = command(&["akismet", "versions", "jetpack"]) else {
+            panic!("expected versions command");
+        };
+        assert_eq!(plugin.as_deref(), Some("jetpack"));
+    }
+
+    #[test]
+    fn export_inherits_filters_and_whitespace() {
+        let Command::Export {
+            plugin,
+            whitespace,
+            filter,
             ..
-        } = cli;
-        let Some(Command::Upgrade {
-            dir, whitespace, ..
-        }) = command
+        } = command(&["--whitespace", "--include-all", "akismet", "export"])
+        else {
+            panic!("expected export command");
+        };
+
+        assert_eq!(plugin.as_deref(), Some("akismet"));
+        assert!(whitespace && filter.include_all);
+    }
+
+    #[test]
+    fn versions_inherits_json() {
+        let Command::Versions { json, .. } = command(&["--json", "versions", "akismet"]) else {
+            panic!("expected versions command");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn upgrade_inherits_whitespace() {
+        let Command::Upgrade {
+            whitespace,
+            dry_run,
+            ..
+        } = command(&["--whitespace", "upgrade", "akismet", "--dry-run"])
         else {
             panic!("expected upgrade command");
         };
+        assert!(whitespace && dry_run);
+    }
 
-        assert_eq!(
-            global_common.command_base_dir(dir.as_deref()),
-            Some(Path::new("/tmp/wordpress"))
-        );
-        assert!(global_common.command_whitespace(whitespace));
+    #[test]
+    fn subcommands_reject_options_they_cannot_honour() {
+        let rejects = |args: &[&str]| {
+            Cli::try_parse_from([&["wpdiff"][..], args].concat())
+                .is_err_and(|e| e.kind() == clap::error::ErrorKind::UnknownArgument)
+        };
+        assert!(rejects(&["export", "akismet", "--all"]));
+        assert!(rejects(&["export", "akismet", "--json"]));
+        assert!(rejects(&["versions", "akismet", "--whitespace"]));
+        assert!(rejects(&["upgrade", "akismet", "--include-all"]));
     }
 }

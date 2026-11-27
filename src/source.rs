@@ -2,170 +2,159 @@ use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::progress;
 
-use crate::plugin::PluginMeta;
+const DOWNLOADS: &str = "https://downloads.wordpress.org/plugin";
+const PLUGIN_INFO_API: &str = "https://api.wordpress.org/plugins/info/1.2/";
 
-pub trait Source: Send + Sync {
-    fn name(&self) -> &str;
-    fn can_handle(&self, plugin: &PluginMeta) -> bool;
-    fn fetch(
-        &self,
-        client: &reqwest::blocking::Client,
-        plugin: &PluginMeta,
-        version: Option<&str>,
-    ) -> Result<FetchResult>;
-}
-
-pub struct FetchResult {
-    pub path: PathBuf,
-    pub _temp_dir: TempDir,
-}
-
-pub struct Registry {
+pub struct WpOrg {
     client: reqwest::blocking::Client,
-    sources: Vec<Box<dyn Source>>,
 }
 
-impl Registry {
-    pub fn new() -> Self {
+/// An upstream plugin package extracted to a temporary directory that is
+/// removed when this value is dropped.
+pub struct Upstream {
+    path: PathBuf,
+    _temp_dir: TempDir,
+}
+
+impl Upstream {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug)]
+pub struct PluginInfo {
+    pub name: String,
+    pub latest_version: String,
+    /// Released versions, ordered by their numeric components.
+    pub versions: Vec<String>,
+}
+
+impl WpOrg {
+    pub fn new() -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_mins(2))
+            .timeout(Duration::from_mins(2))
             .build()
-            .expect("failed to build HTTP client");
-        let mut reg = Self {
-            client,
-            sources: Vec::new(),
-        };
-        reg.sources.push(Box::new(WpOrgSource));
-        reg
+            .context("Failed to set up the HTTP client")?;
+        Ok(Self { client })
     }
 
-    pub fn fetch(&self, plugin: &PluginMeta, version: Option<&str>) -> Result<FetchResult> {
-        for source in &self.sources {
-            if source.can_handle(plugin) {
-                return source
-                    .fetch(&self.client, plugin, version)
-                    .with_context(|| format!("Failed to fetch from {}", source.name()));
-            }
+    /// Downloads the package for `version`, or the current release when
+    /// wordpress.org has no package for that version.
+    pub fn download(&self, slug: &str, version: &str) -> Result<Upstream> {
+        self.find_package(slug, version)
+            .context("Failed to fetch from wordpress.org")
+    }
+
+    fn find_package(&self, slug: &str, version: &str) -> Result<Upstream> {
+        // wordpress.org only builds versioned zips for tagged releases;
+        // plugins served from trunk have just the unversioned one.
+        if !version.is_empty()
+            && let Some(package) =
+                self.download_zip(&format!("{DOWNLOADS}/{slug}.{version}.zip"))?
+        {
+            return Ok(package);
         }
-        bail!(
-            "No source adapter found for plugin '{}'. It may not be available on wordpress.org.",
-            plugin.slug
-        )
+
+        let url = format!("{DOWNLOADS}/{slug}.zip");
+        self.download_zip(&url)?.with_context(|| {
+            format!(
+                "Plugin zip not found at {url}. The plugin may not exist on wordpress.org, \
+                 or this version may not be available."
+            )
+        })
+    }
+
+    /// Returns `None` when wordpress.org has no package at `url`.
+    fn download_zip(&self, url: &str) -> Result<Option<Upstream>> {
+        info!("Downloading {url}...");
+
+        let response = self.client.get(url).send().context(
+            "Failed to connect to downloads.wordpress.org. Check your internet connection.",
+        )?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            bail!(
+                "HTTP {} from wordpress.org for {}. Try again later.",
+                response.status(),
+                url
+            );
+        }
+
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let pb = match response.content_length() {
+            Some(total_size) if total_size > 0 => progress::bar(
+                total_size,
+                "  {spinner:.green} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
+            ),
+            _ => progress::spinner("  {spinner:.green} {bytes} downloaded ({bytes_per_sec})"),
+        };
+
+        let mut bytes = Vec::new();
+        pb.wrap_read(response)
+            .read_to_end(&mut bytes)
+            .context("Failed to read response")?;
+        pb.finish_and_clear();
+
+        debug!("Downloaded {} bytes", bytes.len());
+
+        extract_plugin_zip(bytes)
+            .map(Some)
+            .with_context(|| format!("Failed to extract {url}"))
+    }
+
+    pub fn plugin_info(&self, slug: &str) -> Result<PluginInfo> {
+        let url =
+            format!("{PLUGIN_INFO_API}?action=plugin_information&slug={slug}&fields=versions");
+
+        debug!("Fetching plugin info from {url}");
+
+        let spinner = progress::spinner("  {spinner:.green} Fetching plugin info...");
+        let response = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(30))
+            .send();
+        spinner.finish_and_clear();
+        let response = response
+            .context("Failed to connect to api.wordpress.org. Check your internet connection.")?;
+
+        if !response.status().is_success() {
+            bail!(
+                "wordpress.org API returned HTTP {} for '{}'. Try again later.",
+                response.status(),
+                slug
+            );
+        }
+
+        let body: serde_json::Value = response
+            .json()
+            .context("Failed to parse response from wordpress.org API")?;
+
+        parse_plugin_info(slug, &body)
     }
 }
 
-struct WpOrgSource;
-
-impl Source for WpOrgSource {
-    fn name(&self) -> &'static str {
-        "wordpress.org"
-    }
-
-    fn can_handle(&self, _plugin: &PluginMeta) -> bool {
-        true
-    }
-
-    fn fetch(
-        &self,
-        client: &reqwest::blocking::Client,
-        plugin: &PluginMeta,
-        version: Option<&str>,
-    ) -> Result<FetchResult> {
-        let ver = version.unwrap_or(&plugin.version);
-
-        let urls = if ver.is_empty() {
-            vec![format!(
-                "https://downloads.wordpress.org/plugin/{}.zip",
-                plugin.slug
-            )]
-        } else {
-            vec![
-                format!(
-                    "https://downloads.wordpress.org/plugin/{}.{}.zip",
-                    plugin.slug, ver
-                ),
-                format!("https://downloads.wordpress.org/plugin/{}.zip", plugin.slug),
-            ]
-        };
-
-        let mut last_err = None;
-        for url in &urls {
-            match download_and_extract(client, url, &plugin.slug) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No download URLs available")))
-    }
-}
-
-fn download_and_extract(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    slug: &str,
-) -> Result<FetchResult> {
-    info!("Downloading {url}...");
-
-    let response = client.get(url).send().with_context(|| {
-        "Failed to connect to downloads.wordpress.org. Check your internet connection.".to_string()
-    })?;
-
-    if response.status().as_u16() == 404 {
-        bail!(
-            "Plugin zip not found at {url}. The plugin may not exist on wordpress.org, \
-             or this version may not be available."
-        );
-    }
-    if !response.status().is_success() {
-        bail!(
-            "HTTP {} from wordpress.org for {}. Try again later.",
-            response.status(),
-            url
-        );
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
-    #[allow(clippy::literal_string_with_formatting_args)]
-    let pb = if total_size > 0 {
-        progress::bar(
-            total_size,
-            "  {spinner:.green} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
-        )
-    } else {
-        progress::spinner("  {spinner:.green} {bytes} downloaded ({bytes_per_sec})")
-    };
-
-    let mut bytes = Vec::new();
-    let mut reader = response;
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf).context("Failed to read response")?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        pb.inc(n as u64);
-    }
-    pb.finish_and_clear();
-
-    debug!("Downloaded {} bytes", bytes.len());
-
+/// Extracts a wordpress.org plugin zip, whose entries all live under a single
+/// top-level `<slug>/` directory, without that directory.
+fn extract_plugin_zip(bytes: Vec<u8>) -> Result<Upstream> {
     let temp_dir = TempDir::new().context("Failed to create temp directory")?;
+    let extracted = temp_dir.path().join("extracted");
 
-    let cursor = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
     let entry_count = archive.len();
     debug!("Zip contains {entry_count} entries");
 
-    let extract_pb = progress::bar(
+    let pb = progress::bar(
         entry_count as u64,
         "  {spinner:.green} Extracting [{bar:30.cyan/dim}] {pos}/{len}",
     );
@@ -178,8 +167,7 @@ fn download_and_extract(
         if rel_path.is_empty() {
             continue;
         }
-
-        let out_path = temp_dir.path().join("extracted").join(&rel_path);
+        let out_path = extracted.join(rel_path);
 
         if name.ends_with('/') {
             fs::create_dir_all(&out_path)?;
@@ -190,65 +178,25 @@ fn download_and_extract(
             let mut out_file = fs::File::create(&out_path)?;
             io::copy(&mut file, &mut out_file)?;
         }
-        extract_pb.inc(1);
+        pb.inc(1);
     }
-    extract_pb.finish_and_clear();
+    pb.finish_and_clear();
 
-    let extracted = temp_dir.path().join("extracted");
     if !extracted.is_dir() {
-        bail!("Extraction produced no files for {slug}");
+        bail!("The archive contains no plugin files");
     }
 
-    Ok(FetchResult {
+    Ok(Upstream {
         path: extracted,
         _temp_dir: temp_dir,
     })
 }
 
-pub fn strip_top_dir(zip_path: &str) -> String {
-    zip_path
-        .find('/')
-        .map_or_else(String::new, |idx| zip_path[idx + 1..].to_string())
+fn strip_top_dir(zip_path: &str) -> &str {
+    zip_path.split_once('/').map_or("", |(_, rest)| rest)
 }
 
-#[derive(Debug)]
-pub struct PluginInfo {
-    pub name: String,
-    pub latest_version: String,
-    pub versions: Vec<String>,
-}
-
-pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
-    let url = format!(
-        "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&slug={slug}&fields=versions"
-    );
-
-    debug!("Fetching plugin info from {url}");
-
-    let spinner = progress::spinner("  {spinner:.green} Fetching plugin info...");
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let response = client.get(&url).send().with_context(|| {
-        "Failed to connect to api.wordpress.org. Check your internet connection.".to_string()
-    })?;
-
-    spinner.finish_and_clear();
-
-    if !response.status().is_success() {
-        bail!(
-            "wordpress.org API returned HTTP {} for '{}'. Try again later.",
-            response.status(),
-            slug
-        );
-    }
-
-    let body: serde_json::Value = response
-        .json()
-        .context("Failed to parse response from wordpress.org API")?;
-
+fn parse_plugin_info(slug: &str, body: &serde_json::Value) -> Result<PluginInfo> {
     if body.get("error").is_some() {
         bail!(
             "Plugin '{slug}' not found on wordpress.org. \
@@ -256,33 +204,18 @@ pub fn fetch_plugin_versions(slug: &str) -> Result<PluginInfo> {
         );
     }
 
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(slug)
+    let name = body["name"].as_str().unwrap_or(slug).to_string();
+    let latest_version = body["version"]
+        .as_str()
+        .with_context(|| format!("wordpress.org API reported no current version for '{slug}'"))?
         .to_string();
 
-    let latest_version = body
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let versions: Vec<String> = body
-        .get("versions")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.keys().filter(|k| *k != "trunk").cloned().collect())
+    // A plugin without tagged releases has `"versions": []` instead of an object.
+    let mut versions: Vec<String> = body["versions"]
+        .as_object()
+        .map(|tags| tags.keys().filter(|tag| *tag != "trunk").cloned().collect())
         .unwrap_or_default();
-
-    let mut keyed: Vec<(Vec<u64>, String)> = versions
-        .into_iter()
-        .map(|v| {
-            let key = version_sort_key(&v);
-            (key, v)
-        })
-        .collect();
-    keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let versions = keyed.into_iter().map(|(_, v)| v).collect();
+    versions.sort_by_cached_key(|v| version_sort_key(v));
 
     Ok(PluginInfo {
         name,
@@ -301,101 +234,90 @@ fn version_sort_key(version: &str) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::Write;
 
-    #[test]
-    fn strip_top_dir_normal() {
-        assert_eq!(strip_top_dir("akismet/akismet.php"), "akismet.php");
+    fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, content) in entries {
+            if name.ends_with('/') {
+                zip.add_directory(*name, options).unwrap();
+            } else {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(content.as_bytes()).unwrap();
+            }
+        }
+        zip.finish().unwrap().into_inner()
     }
 
     #[test]
-    fn strip_top_dir_nested() {
-        assert_eq!(strip_top_dir("akismet/languages/en.po"), "languages/en.po");
+    fn extract_drops_the_top_level_directory() {
+        let upstream = extract_plugin_zip(zip_of(&[
+            ("akismet/", ""),
+            ("akismet/akismet.php", "<?php\n"),
+            ("akismet/views/", ""),
+            ("akismet/views/a.php", "view\n"),
+            ("akismet/_inc/deep/b.js", "js\n"),
+        ]))
+        .unwrap();
+
+        let read = |rel: &str| fs::read_to_string(upstream.path().join(rel)).unwrap();
+        assert_eq!(read("akismet.php"), "<?php\n");
+        assert_eq!(read("views/a.php"), "view\n");
+        assert_eq!(read("_inc/deep/b.js"), "js\n");
     }
 
     #[test]
-    fn strip_top_dir_directory_entry() {
-        assert_eq!(strip_top_dir("akismet/"), "");
+    fn extract_rejects_archive_without_plugin_files() {
+        assert!(extract_plugin_zip(zip_of(&[("stray.txt", "x")])).is_err());
+        assert!(extract_plugin_zip(b"not a zip".to_vec()).is_err());
     }
 
     #[test]
-    fn strip_top_dir_no_slash() {
-        assert_eq!(strip_top_dir("file.txt"), "");
+    fn extracted_files_are_removed_on_drop() {
+        let upstream = extract_plugin_zip(zip_of(&[("p/p.php", "<?php\n")])).unwrap();
+        let path = upstream.path().to_path_buf();
+        assert!(path.join("p.php").is_file());
+        drop(upstream);
+        assert!(!path.exists());
     }
 
     #[test]
-    fn strip_top_dir_empty() {
-        assert_eq!(strip_top_dir(""), "");
+    fn plugin_info_sorts_versions_numerically_and_drops_trunk() {
+        let info = parse_plugin_info(
+            "akismet",
+            &json!({
+                "name": "Akismet",
+                "version": "2.0.0",
+                "versions": {
+                    "1.10.0": "u", "1.9.0": "u", "2.0.0": "u", "1.0.0": "u", "trunk": "u",
+                },
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(info.name, "Akismet");
+        assert_eq!(info.latest_version, "2.0.0");
+        assert_eq!(info.versions, ["1.0.0", "1.9.0", "1.10.0", "2.0.0"]);
     }
 
     #[test]
-    fn version_sort_key_simple() {
-        assert_eq!(version_sort_key("1.2.3"), vec![1, 2, 3]);
+    fn plugin_info_tolerates_missing_name_and_empty_versions() {
+        let info =
+            parse_plugin_info("my-plugin", &json!({ "version": "1.0", "versions": [] })).unwrap();
+        assert_eq!(info.name, "my-plugin");
+        assert_eq!(info.versions, Vec::<String>::new());
     }
 
     #[test]
-    fn version_sort_key_with_prerelease() {
-        assert_eq!(version_sort_key("2.0.0-beta.1"), vec![2, 0, 0, 1]);
+    fn plugin_info_reports_unknown_plugin() {
+        let err = parse_plugin_info("nope", &json!({ "error": "Plugin not found." })).unwrap_err();
+        assert!(err.to_string().contains("'nope' not found"));
     }
 
     #[test]
-    fn version_sort_key_strips_non_numeric() {
-        assert_eq!(version_sort_key("1.0.0-rc.2"), vec![1, 0, 0, 2]);
-    }
-
-    #[test]
-    fn version_sort_key_empty() {
-        assert_eq!(version_sort_key(""), Vec::<u64>::new());
-    }
-
-    #[test]
-    fn version_sort_key_single() {
-        assert_eq!(version_sort_key("5"), vec![5]);
-    }
-
-    #[test]
-    fn version_sort_ordering() {
-        let versions = vec![
-            "1.10.0".to_string(),
-            "1.9.0".to_string(),
-            "2.0.0".to_string(),
-            "1.0.0".to_string(),
-        ];
-
-        let mut keyed: Vec<(Vec<u64>, String)> = versions
-            .into_iter()
-            .map(|v| {
-                let key = version_sort_key(&v);
-                (key, v)
-            })
-            .collect();
-        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let sorted: Vec<String> = keyed.into_iter().map(|(_, v)| v).collect();
-
-        assert_eq!(sorted, vec!["1.0.0", "1.9.0", "1.10.0", "2.0.0"]);
-    }
-
-    #[test]
-    fn version_sort_with_prereleases() {
-        let versions = vec![
-            "2.0.0".to_string(),
-            "2.0.0-beta.1".to_string(),
-            "1.9.0".to_string(),
-            "2.0.0-rc.1".to_string(),
-        ];
-
-        let mut keyed: Vec<(Vec<u64>, String)> = versions
-            .into_iter()
-            .map(|v| {
-                let key = version_sort_key(&v);
-                (key, v)
-            })
-            .collect();
-        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let sorted: Vec<String> = keyed.into_iter().map(|(_, v)| v).collect();
-
-        assert_eq!(sorted[0], "1.9.0");
-        assert_eq!(sorted[1], "2.0.0");
-        assert!(sorted.contains(&"2.0.0-beta.1".to_string()));
-        assert!(sorted.contains(&"2.0.0-rc.1".to_string()));
+    fn plugin_info_requires_a_current_version() {
+        assert!(parse_plugin_info("x", &json!({ "name": "X" })).is_err());
     }
 }
