@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -167,6 +167,14 @@ fn extract_plugin_zip(bytes: Vec<u8>) -> Result<Upstream> {
         if rel_path.is_empty() {
             continue;
         }
+        // Entry names are archive-controlled: `..` or a rooted path would be
+        // written outside the extraction directory.
+        let stays_inside = Path::new(rel_path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+        if !stays_inside {
+            bail!("Refusing to extract `{name}`: the entry points outside the package directory");
+        }
         let out_path = extracted.join(rel_path);
 
         if name.ends_with('/') {
@@ -272,6 +280,21 @@ mod tests {
     fn extract_rejects_archive_without_plugin_files() {
         assert!(extract_plugin_zip(zip_of(&[("stray.txt", "x")])).is_err());
         assert!(extract_plugin_zip(b"not a zip".to_vec()).is_err());
+    }
+
+    #[test]
+    fn extract_refuses_entries_that_escape_the_package_directory() {
+        for name in [
+            "akismet/../../evil.php",
+            "akismet/inc/../../../evil.php",
+            "akismet//tmp/evil.php",
+        ] {
+            let archive = zip_of(&[("akismet/akismet.php", "<?php\n"), (name, "evil\n")]);
+            let Err(err) = extract_plugin_zip(archive) else {
+                panic!("{name} was extracted");
+            };
+            assert!(err.to_string().contains(name), "{err}");
+        }
     }
 
     #[test]
