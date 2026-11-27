@@ -38,24 +38,17 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: version
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
             use_cross: false
             install_musl: true
             verify_static: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
             use_cross: true
-            install_musl: false
-            verify_static: false
-          - target: aarch64-apple-darwin
-            os: macos-15
-            use_cross: false
             install_musl: false
             verify_static: false
     steps:
@@ -103,11 +96,7 @@ jobs:
           archive="wpdiff-${VERSION}-${{ matrix.target }}.tar.gz"
           tar -C target/${{ matrix.target }}/release -czf "dist/$archive" wpdiff
           cd dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$archive" > "$archive.sha256"
-          else
-            shasum -a 256 "$archive" > "$archive.sha256"
-          fi
+          sha256sum "$archive" > "$archive.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
