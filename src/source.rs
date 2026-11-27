@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
+use crate::plugin;
 use crate::progress;
 
 const DOWNLOADS: &str = "https://downloads.wordpress.org/plugin";
@@ -45,16 +46,14 @@ impl WpOrg {
         Ok(Self { client })
     }
 
-    /// Downloads the package for `version`, or the current release when
-    /// wordpress.org has no package for that version.
+    /// Downloads the package of exactly `version`. An empty `version` (the
+    /// plugin header has none) asks for the current release.
     pub fn download(&self, slug: &str, version: &str) -> Result<Upstream> {
         self.find_package(slug, version)
             .context("Failed to fetch from wordpress.org")
     }
 
     fn find_package(&self, slug: &str, version: &str) -> Result<Upstream> {
-        // wordpress.org only builds versioned zips for tagged releases;
-        // plugins served from trunk have just the unversioned one.
         if !version.is_empty()
             && let Some(package) =
                 self.download_zip(&format!("{DOWNLOADS}/{slug}.{version}.zip"))?
@@ -62,13 +61,21 @@ impl WpOrg {
             return Ok(package);
         }
 
+        // wordpress.org only builds versioned zips for tagged releases;
+        // plugins served from trunk have just the unversioned one, which is
+        // always the current release.
         let url = format!("{DOWNLOADS}/{slug}.zip");
-        self.download_zip(&url)?.with_context(|| {
+        let current = self.download_zip(&url)?.with_context(|| {
             format!(
                 "Plugin zip not found at {url}. The plugin may not exist on wordpress.org, \
                  or this version may not be available."
             )
-        })
+        })?;
+        if version.is_empty() {
+            Ok(current)
+        } else {
+            require_version(current, slug, version)
+        }
     }
 
     /// Returns `None` when wordpress.org has no package at `url`.
@@ -200,6 +207,19 @@ fn extract_plugin_zip(bytes: Vec<u8>) -> Result<Upstream> {
     })
 }
 
+fn require_version(package: Upstream, slug: &str, version: &str) -> Result<Upstream> {
+    let found = plugin::discover_plugin(package.path())
+        .context("Failed to read the version of the downloaded package")?
+        .version;
+    if found != version {
+        bail!(
+            "wordpress.org has no package for {slug} v{version}; the only one it serves is the \
+             current release, v{found}. Run `wpdiff versions {slug}` to list available versions."
+        );
+    }
+    Ok(package)
+}
+
 fn strip_top_dir(zip_path: &str) -> &str {
     zip_path.split_once('/').map_or("", |(_, rest)| rest)
 }
@@ -295,6 +315,24 @@ mod tests {
             };
             assert!(err.to_string().contains(name), "{err}");
         }
+    }
+
+    #[test]
+    fn current_release_only_stands_in_for_its_own_version() {
+        let current = || {
+            extract_plugin_zip(zip_of(&[(
+                "hello/hello.php",
+                "<?php\n/*\nPlugin Name: Hello\nVersion: 1.7.2\n*/\n",
+            )]))
+            .unwrap()
+        };
+
+        assert!(require_version(current(), "hello", "1.7.2").is_ok());
+        let Err(err) = require_version(current(), "hello", "9.9.9") else {
+            panic!("the current release was accepted as v9.9.9");
+        };
+        assert!(err.to_string().contains("no package for hello v9.9.9"));
+        assert!(err.to_string().contains("v1.7.2"));
     }
 
     #[test]
