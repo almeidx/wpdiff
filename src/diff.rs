@@ -290,6 +290,8 @@ fn format_unified(diff: &TextDiff<'_, '_, str>, old_label: &str, new_label: &str
         .to_string()
 }
 
+/// Dependency and version-control directories: never walked, and everything
+/// below one is an artifact.
 const SKIP_DIRS: &[&str] = &["node_modules", "external", ".git", ".svn", ".hg", "vendor"];
 
 struct Tree {
@@ -349,7 +351,7 @@ fn normalize_whitespace(content: &str) -> String {
         .join("\n")
 }
 
-const ARTIFACT_DIRS: &[&str] = &["node_modules/", "vendor/", "dist/", "build/", ".git/"];
+const BUILD_DIRS: &[&str] = &["dist", "build"];
 const ARTIFACT_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".map", ".bundle.js", ".chunk.js"];
 const ASSET_SUFFIXES: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff", ".woff", ".woff2",
@@ -369,9 +371,12 @@ const METADATA_SUFFIXES: &[&str] = &[".pot", ".po", ".mo"];
 fn categorize_file(path: &str) -> FileCategory {
     let lower = path.to_lowercase();
     let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| lower.ends_with(s));
-    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    let (dirs, file_name) = lower.rsplit_once('/').unwrap_or(("", lower.as_str()));
+    let in_artifact_dir = dirs
+        .split('/')
+        .any(|dir| SKIP_DIRS.contains(&dir) || BUILD_DIRS.contains(&dir));
 
-    if ARTIFACT_DIRS.iter().any(|dir| lower.contains(dir)) || ends_with_any(ARTIFACT_SUFFIXES) {
+    if in_artifact_dir || ends_with_any(ARTIFACT_SUFFIXES) {
         FileCategory::Artifact
     } else if ends_with_any(ASSET_SUFFIXES) {
         FileCategory::Asset
@@ -445,6 +450,15 @@ mod tests {
     fn categorize_generated_locations_win_over_file_type() {
         assert_eq!(categorize_file("src/dist/logo.png"), FileCategory::Artifact);
         assert_eq!(categorize_file("build/readme.txt"), FileCategory::Artifact);
+    }
+
+    #[test]
+    fn categorize_artifact_dirs_match_whole_directory_names() {
+        assert_eq!(categorize_file("src/rebuild/x.php"), FileCategory::Source);
+        assert_eq!(categorize_file("my-vendor/a.php"), FileCategory::Source);
+        assert_eq!(categorize_file("inc/build"), FileCategory::Source);
+        assert_eq!(categorize_file("inc/build/x.php"), FileCategory::Artifact);
+        assert_eq!(categorize_file("external/x.php"), FileCategory::Artifact);
     }
 
     #[test]
