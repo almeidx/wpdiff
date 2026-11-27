@@ -28,10 +28,17 @@ impl DirDiff {
     /// `summary.unchanged` keeps counting every identical file, whatever its
     /// category.
     #[must_use]
-    pub fn filtered(mut self, filter: &Filter) -> Self {
-        self.files.retain(|f| filter.accepts(f));
-        self.summary = DiffSummary::of(&self.files, self.summary.unchanged);
-        self
+    pub fn filtered(self, filter: &Filter) -> Self {
+        self.partition(filter).0
+    }
+
+    /// Like `filtered`, and also returns the files the filter rejects.
+    pub fn partition(mut self, filter: &Filter) -> (Self, Vec<FileDiff>) {
+        let (kept, rejected): (Vec<_>, Vec<_>) =
+            self.files.into_iter().partition(|f| filter.accepts(f));
+        self.summary = DiffSummary::of(&kept, self.summary.unchanged);
+        self.files = kept;
+        (self, rejected)
     }
 
     /// All file diffs as one unified patch (upstream → local).
@@ -198,8 +205,27 @@ pub fn diff_directories(
     upstream_dir: &Path,
     strict_whitespace: bool,
 ) -> Result<DirDiff> {
-    let local = collect_files(local_dir)?;
-    let upstream = collect_files(upstream_dir)?;
+    diff_walked(local_dir, upstream_dir, strict_whitespace, SKIP_DIRS)
+}
+
+/// Like `diff_directories`, but also walks the dependency and version-control
+/// directories it skips.
+pub fn diff_directories_in_full(
+    local_dir: &Path,
+    upstream_dir: &Path,
+    strict_whitespace: bool,
+) -> Result<DirDiff> {
+    diff_walked(local_dir, upstream_dir, strict_whitespace, &[])
+}
+
+fn diff_walked(
+    local_dir: &Path,
+    upstream_dir: &Path,
+    strict_whitespace: bool,
+    skip_dirs: &[&str],
+) -> Result<DirDiff> {
+    let local = collect_files(local_dir, skip_dirs)?;
+    let upstream = collect_files(upstream_dir, skip_dirs)?;
 
     debug!(
         "Comparing {} local files against {} upstream files",
@@ -301,7 +327,7 @@ struct Tree {
     skipped_dirs: Vec<String>,
 }
 
-fn collect_files(dir: &Path) -> Result<Tree> {
+fn collect_files(dir: &Path, skip_dirs: &[&str]) -> Result<Tree> {
     let mut files = BTreeSet::new();
     let mut skipped_dirs = Vec::new();
 
@@ -312,7 +338,7 @@ fn collect_files(dir: &Path) -> Result<Tree> {
 
         if file_type.is_dir() {
             let name = entry.file_name();
-            if SKIP_DIRS.iter().any(|skip| name == *skip) {
+            if skip_dirs.iter().any(|skip| name == *skip) {
                 if entry.depth() == 1 {
                     skipped_dirs.push(name.to_string_lossy().into_owned());
                 }
@@ -661,6 +687,30 @@ mod tests {
         assert_eq!(paths(&diff), ["vendor_custom/z.php"]);
         assert_eq!(diff.skipped_dirs.local, ["node_modules", "vendor"]);
         assert_eq!(diff.skipped_dirs.upstream, ["vendor"]);
+    }
+
+    #[test]
+    fn full_diff_walks_dependency_dirs_and_partition_sets_them_aside() {
+        let local = tree(&[
+            ("a.php", "changed\n"),
+            ("vendor/lib/x.php", "patched\n"),
+            ("src/external/y.php", "nested\n"),
+            ("logo.png", "new\n"),
+        ]);
+        let upstream = tree(&[("a.php", "hello\n"), ("vendor/lib/x.php", "upstream\n")]);
+
+        let (kept, rejected) = diff_directories_in_full(local.path(), upstream.path(), false)
+            .unwrap()
+            .partition(&Filter::default());
+
+        assert_eq!(paths(&kept), ["a.php"]);
+        assert_eq!(kept.summary.modified, 1);
+        assert_eq!(kept.summary.added, 0);
+        let rejected: Vec<&str> = rejected.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            rejected,
+            ["logo.png", "src/external/y.php", "vendor/lib/x.php"]
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use log::{debug, info};
 use similar::{ChangeTag, TextDiff};
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
@@ -9,7 +10,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-use crate::diff::{self, CONTEXT_RADIUS, DirDiff, Filter};
+use crate::diff::{self, CONTEXT_RADIUS, DirDiff, FileDiff, Filter, SkippedDirs};
 use crate::output;
 use crate::plugin::PluginMeta;
 use crate::source::WpOrg;
@@ -74,11 +75,15 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
     info!("Capturing local customizations...");
     let wporg = WpOrg::new()?;
     let current_upstream = wporg.download(&meta.slug, &meta.version)?;
-    let customizations =
-        diff::diff_directories(&meta.dir, current_upstream.path(), opts.strict_whitespace)?
-            .filtered(&Filter::default());
+    // The swap replaces the whole directory, dependency directories included,
+    // so every local change is collected: the ones the patch cannot carry are
+    // at least reported.
+    let (customizations, left_behind) =
+        diff::diff_directories_in_full(&meta.dir, current_upstream.path(), opts.strict_whitespace)?
+            .partition(&Filter::default());
     let has_customizations = !customizations.files.is_empty();
     print_customizations(&customizations);
+    print_left_behind(left_behind);
 
     let new_version = if let Some(version) = opts.target_version {
         version.to_string()
@@ -210,6 +215,62 @@ fn print_customizations(customizations: &DirDiff) {
     );
     for file in &customizations.files {
         println!("    {} {}", "~".yellow(), file.path);
+    }
+}
+
+/// Groups changes by top-level directory, with `""` for the plugin root.
+fn by_outer_folder(files: Vec<FileDiff>) -> BTreeMap<String, DirDiff> {
+    let mut groups: BTreeMap<String, Vec<FileDiff>> = BTreeMap::new();
+    for file in files {
+        let folder = file.path.split_once('/').map_or("", |(outer, _)| outer);
+        groups.entry(folder.to_string()).or_default().push(file);
+    }
+    groups
+        .into_iter()
+        .map(|(folder, files)| (folder, DirDiff::new(files, SkippedDirs::default(), 0)))
+        .collect()
+}
+
+fn print_left_behind(files: Vec<FileDiff>) {
+    if files.is_empty() {
+        return;
+    }
+
+    println!(
+        "\n  {} {} changed files are build artifacts, assets or dependencies and are {}.",
+        "⚠".yellow().bold(),
+        files.len().to_string().bold(),
+        "not carried over".yellow(),
+    );
+    println!("    The upgrade replaces them with upstream's; only the backup zip keeps yours.");
+
+    let groups: Vec<(String, DirDiff)> = by_outer_folder(files)
+        .into_iter()
+        .map(|(folder, changes)| {
+            let label = if folder.is_empty() {
+                "(plugin root)".to_string()
+            } else {
+                format!("{folder}/")
+            };
+            (label, changes)
+        })
+        .collect();
+    let width = groups
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0);
+
+    for (label, changes) in &groups {
+        let (insertions, deletions) = changes.line_changes();
+        println!(
+            "    {label:<width$}  {} added, {} changed, {} removed  ({} {})",
+            changes.summary.added,
+            changes.summary.modified,
+            changes.summary.removed,
+            format!("+{insertions}").green(),
+            format!("-{deletions}").red(),
+        );
     }
 }
 
@@ -661,6 +722,46 @@ mod tests {
             "deep\n"
         );
         assert!(dst.join("empty").is_dir());
+    }
+
+    #[test]
+    fn left_behind_changes_are_totalled_per_outer_folder() {
+        use crate::diff::{FileCategory, FileStatus};
+        let file = |path: &str, status, insertions, deletions| FileDiff {
+            path: path.to_string(),
+            status,
+            category: FileCategory::Artifact,
+            insertions,
+            deletions,
+            diff_text: String::new(),
+        };
+
+        let groups = by_outer_folder(vec![
+            file("app.min.js", FileStatus::Removed, 0, 4),
+            file("vendor/a.php", FileStatus::Added, 2, 0),
+            file("vendor/lib/deep/b.php", FileStatus::Modified, 3, 1),
+            file("dist/out.js", FileStatus::Added, 5, 0),
+        ]);
+
+        let totals: Vec<_> = groups
+            .iter()
+            .map(|(folder, changes)| {
+                let summary = &changes.summary;
+                (
+                    folder.as_str(),
+                    (summary.added, summary.modified, summary.removed),
+                    changes.line_changes(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            totals,
+            [
+                ("", (0, 0, 1), (0, 4)),
+                ("dist", (1, 0, 0), (5, 0)),
+                ("vendor", (1, 1, 0), (5, 1)),
+            ]
+        );
     }
 
     #[test]
