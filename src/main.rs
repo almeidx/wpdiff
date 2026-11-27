@@ -45,7 +45,7 @@ struct Cli {
     quiet: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct DiffArgs {
     /// Plugin slug or path to plugin directory
     plugin: Option<String>,
@@ -66,7 +66,7 @@ struct DiffArgs {
     json: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct FilterArgs {
     /// Include build artifacts (.min.js, vendor/, etc.)
     #[arg(long)]
@@ -139,6 +139,22 @@ impl DiffArgs {
             json: self.json || outer.json,
         }
     }
+
+    /// The command-line name of an option that is set, if any; the plugin is
+    /// not an option.
+    fn set_option(&self) -> Option<&'static str> {
+        [
+            ("--all", self.all),
+            ("--whitespace", self.whitespace),
+            ("--include-artifacts", self.filter.include_artifacts),
+            ("--include-assets", self.filter.include_assets),
+            ("--include-all", self.filter.include_all),
+            ("--exclude", !self.filter.exclude.is_empty()),
+            ("--json", self.json),
+        ]
+        .into_iter()
+        .find_map(|(option, set)| set.then_some(option))
+    }
 }
 
 impl FilterArgs {
@@ -162,39 +178,62 @@ impl FilterArgs {
 
 impl Command {
     /// Options given before the subcommand name also apply to it: flags and
-    /// `-x` patterns combine, a plugin named after the subcommand wins.
-    fn inherit(self, outer: DiffArgs) -> Self {
-        match self {
-            Self::Summary(args) => Self::Summary(args.or(outer)),
+    /// `-x` patterns combine, a plugin named after the subcommand wins. An
+    /// option the subcommand has no use for is an error, as it is after the
+    /// name.
+    fn inherit(self, mut outer: DiffArgs) -> Result<Self, clap::Error> {
+        use std::mem::take;
+
+        let (name, command) = match self {
+            Self::Summary(args) => ("summary", Self::Summary(args.or(take(&mut outer)))),
             Self::Export {
                 plugin,
                 output,
                 whitespace,
                 filter,
-            } => Self::Export {
-                plugin: plugin.or(outer.plugin),
-                output,
-                whitespace: whitespace || outer.whitespace,
-                filter: filter.or(outer.filter),
-            },
-            Self::Versions { plugin, json } => Self::Versions {
-                plugin: plugin.or(outer.plugin),
-                json: json || outer.json,
-            },
+            } => (
+                "export",
+                Self::Export {
+                    plugin: plugin.or_else(|| outer.plugin.take()),
+                    output,
+                    whitespace: whitespace || take(&mut outer.whitespace),
+                    filter: filter.or(take(&mut outer.filter)),
+                },
+            ),
+            Self::Versions { plugin, json } => (
+                "versions",
+                Self::Versions {
+                    plugin: plugin.or_else(|| outer.plugin.take()),
+                    json: json || take(&mut outer.json),
+                },
+            ),
             Self::Upgrade {
                 plugin,
                 to,
                 yes,
                 dry_run,
                 whitespace,
-            } => Self::Upgrade {
-                plugin: plugin.or(outer.plugin),
-                to,
-                yes,
-                dry_run,
-                whitespace: whitespace || outer.whitespace,
+            } => (
+                "upgrade",
+                Self::Upgrade {
+                    plugin: plugin.or_else(|| outer.plugin.take()),
+                    to,
+                    yes,
+                    dry_run,
+                    whitespace: whitespace || take(&mut outer.whitespace),
+                },
+            ),
+        };
+
+        outer.set_option().map_or_else(
+            || Ok(command),
+            |option| {
+                Err(Cli::command().error(
+                    clap::error::ErrorKind::UnknownArgument,
+                    format!("'{option}' cannot be used with '{name}'"),
+                ))
             },
-        }
+        )
     }
 }
 
@@ -239,7 +278,7 @@ fn run(cli: Cli) -> Result<()> {
         return cmd_diff(&cli.diff, dir, Format::Diff);
     };
 
-    match command.inherit(cli.diff) {
+    match command.inherit(cli.diff).unwrap_or_else(|e| e.exit()) {
         Command::Summary(args) => cmd_diff(&args, dir, Format::Summary),
         Command::Export {
             plugin,
@@ -560,7 +599,10 @@ mod tests {
 
     fn command(args: &[&str]) -> Command {
         let cli = parse(args);
-        cli.command.expect("a subcommand").inherit(cli.diff)
+        cli.command
+            .expect("a subcommand")
+            .inherit(cli.diff)
+            .unwrap()
     }
 
     #[test]
@@ -681,5 +723,26 @@ mod tests {
         assert!(rejects(&["export", "akismet", "--json"]));
         assert!(rejects(&["versions", "akismet", "--whitespace"]));
         assert!(rejects(&["upgrade", "akismet", "--include-all"]));
+    }
+
+    #[test]
+    fn subcommands_reject_those_options_before_their_name_too() {
+        let assert_rejects = |args: &[&str], option: &str| {
+            let cli = parse(args);
+            let Err(err) = cli.command.expect("a subcommand").inherit(cli.diff) else {
+                panic!("{args:?} was accepted");
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert!(err.to_string().contains(&format!("'{option}' cannot")));
+        };
+        assert_rejects(&["--all", "export", "akismet"], "--all");
+        assert_rejects(&["--json", "export", "akismet"], "--json");
+        assert_rejects(&["--whitespace", "versions", "akismet"], "--whitespace");
+        assert_rejects(&["-x", "views", "versions", "akismet"], "--exclude");
+        assert_rejects(
+            &["--include-assets", "upgrade", "akismet"],
+            "--include-assets",
+        );
+        assert_rejects(&["--json", "upgrade", "akismet"], "--json");
     }
 }
