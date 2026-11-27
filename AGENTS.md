@@ -19,7 +19,9 @@ Practical consequences:
 - `upgrade --dry-run` exercises staging and patch reapply without touching the
   live plugin directory.
 - The live plugin swap is the last step of `upgrade`, after a backup zip exists
-  and conflicts have either been resolved or surfaced for manual handling.
+  and conflicts have either been resolved or surfaced for manual handling. It
+  is one atomic exchange with a copy staged next to the plugin; nothing is
+  written into the live directory itself.
 - Temporary staging must use `tempfile::TempDir` so failed runs clean up after
   themselves.
 

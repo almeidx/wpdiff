@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use log::{debug, info};
+use log::{debug, info, warn};
+use rustix::fs::{CWD, RenameFlags, renameat_with};
+use rustix::io::Errno;
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -185,9 +187,7 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
     create_zip_backup(&meta.dir, &backup_path)?;
 
     info!("Replacing plugin directory...");
-    fs::remove_dir_all(&meta.dir)
-        .with_context(|| format!("Failed to remove {}", meta.dir.display()))?;
-    copy_dir_recursive(&staged_plugin, &meta.dir)?;
+    replace_plugin_dir(&meta.dir, &staged_plugin)?;
 
     println!(
         "\n  {} {} upgraded to v{}",
@@ -598,6 +598,78 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Puts a copy of `staged` in place of the live plugin directory.
+///
+/// The copy is made next to the plugin first, so the live directory changes
+/// in a single exchange: `WordPress` sees the old plugin or the new one, never a
+/// missing or half-written directory, and a failed copy leaves the old one
+/// untouched.
+fn replace_plugin_dir(live: &Path, staged: &Path) -> Result<()> {
+    let (Some(plugins_dir), Some(name)) = (live.parent(), live.file_name()) else {
+        bail!(
+            "Cannot replace {}: it has no parent directory",
+            live.display()
+        );
+    };
+    // A sibling shares the plugin's filesystem, which a rename needs, and
+    // WordPress ignores dot-prefixed entries of the plugins directory.
+    let sibling = tempfile::Builder::new()
+        .prefix(&format!(".{}.wpdiff-", name.to_string_lossy()))
+        .tempdir_in(plugins_dir)
+        .with_context(|| {
+            format!(
+                "Failed to create a staging directory in {}",
+                plugins_dir.display()
+            )
+        })?;
+    let incoming = sibling.path().join("new");
+    let outgoing = sibling.path().join("old");
+    copy_dir_recursive(staged, &incoming)?;
+
+    if let Err(e) = swap_dirs(&incoming, live, &outgoing) {
+        if !live.exists() {
+            // Removing the staging directory now would delete the plugin.
+            let kept = sibling.keep();
+            bail!(
+                "Failed to swap the upgraded plugin into {}: {e}. The previous plugin is in {}; \
+                 move it back by hand.",
+                live.display(),
+                kept.join("old").display()
+            );
+        }
+        return Err(e).with_context(|| {
+            format!("Failed to swap the upgraded plugin into {}", live.display())
+        });
+    }
+
+    let previous = sibling.path().to_path_buf();
+    if let Err(e) = sibling.close() {
+        warn!(
+            "The previous plugin files could not be removed from {}: {e}",
+            previous.display()
+        );
+    }
+    Ok(())
+}
+
+/// Moves `incoming` to `live`. What was at `live` ends up at `incoming` or
+/// at `outgoing`.
+fn swap_dirs(incoming: &Path, live: &Path, outgoing: &Path) -> io::Result<()> {
+    match renameat_with(CWD, incoming, CWD, live, RenameFlags::EXCHANGE) {
+        // NFS and kernels before 3.15 cannot exchange two paths.
+        Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {
+            swap_by_renames(incoming, live, outgoing)
+        }
+        result => Ok(result?),
+    }
+}
+
+/// Not atomic: between the two renames nothing is at `live`.
+fn swap_by_renames(incoming: &Path, live: &Path, outgoing: &Path) -> io::Result<()> {
+    fs::rename(live, outgoing)?;
+    fs::rename(incoming, live).or_else(|e| fs::rename(outgoing, live).and(Err(e)))
+}
+
 fn create_zip_backup(dir: &Path, zip_path: &str) -> Result<()> {
     let file =
         fs::File::create(zip_path).with_context(|| format!("Failed to create {zip_path}"))?;
@@ -762,6 +834,86 @@ mod tests {
                 ("vendor", (1, 1, 0), (5, 1)),
             ]
         );
+    }
+
+    fn dir_with(files: &[(&str, &str)]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        dir
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn replacing_the_plugin_swaps_in_the_staged_tree_and_leaves_nothing_behind() {
+        let plugins = dir_with(&[("akismet/old.php", "old\n"), ("akismet/inc/x.php", "x\n")]);
+        let staged = dir_with(&[("new.php", "new\n"), ("views/v.php", "v\n")]);
+        let live = plugins.path().join("akismet");
+
+        replace_plugin_dir(&live, staged.path()).unwrap();
+
+        assert_eq!(entries(plugins.path()), ["akismet"]);
+        assert_eq!(entries(&live), ["new.php", "views"]);
+        assert_eq!(fs::read_to_string(live.join("views/v.php")).unwrap(), "v\n");
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_the_live_plugin_untouched() {
+        let plugins = dir_with(&[("akismet/old.php", "old\n")]);
+        let live = plugins.path().join("akismet");
+        let missing = plugins.path().join("no-such-staging-dir");
+
+        assert!(replace_plugin_dir(&live, &missing).is_err());
+
+        assert_eq!(entries(plugins.path()), ["akismet"]);
+        assert_eq!(fs::read_to_string(live.join("old.php")).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn swapping_by_renames_keeps_the_previous_tree_aside() {
+        let root = dir_with(&[("live/old.php", "old\n"), ("incoming/new.php", "new\n")]);
+        let at = |name: &str| root.path().join(name);
+
+        swap_by_renames(&at("incoming"), &at("live"), &at("outgoing")).unwrap();
+
+        assert_eq!(entries(root.path()), ["live", "outgoing"]);
+        assert_eq!(entries(&at("live")), ["new.php"]);
+        assert_eq!(entries(&at("outgoing")), ["old.php"]);
+    }
+
+    #[test]
+    fn swapping_moves_the_previous_tree_out_of_the_way() {
+        let root = dir_with(&[("live/old.php", "old\n"), ("incoming/new.php", "new\n")]);
+        let at = |name: &str| root.path().join(name);
+
+        swap_dirs(&at("incoming"), &at("live"), &at("outgoing")).unwrap();
+
+        assert_eq!(entries(&at("live")), ["new.php"]);
+        // An exchange leaves the old tree at `incoming`, the fallback at `outgoing`.
+        let previous = entries(root.path()).into_iter().find(|name| name != "live");
+        assert_eq!(entries(&at(&previous.unwrap())), ["old.php"]);
+    }
+
+    #[test]
+    fn swapping_by_renames_restores_the_plugin_when_the_new_tree_is_missing() {
+        let root = dir_with(&[("live/old.php", "old\n")]);
+        let at = |name: &str| root.path().join(name);
+
+        assert!(swap_by_renames(&at("incoming"), &at("live"), &at("outgoing")).is_err());
+
+        assert_eq!(entries(root.path()), ["live"]);
+        assert_eq!(entries(&at("live")), ["old.php"]);
     }
 
     #[test]
