@@ -422,6 +422,40 @@ pub fn render_scan_footer(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ScanDocument<'a> {
+    changed: &'a [Report],
+    unchanged: usize,
+    unmatched: Vec<UnmatchedPlugin<'a>>,
+}
+
+#[derive(Serialize)]
+struct UnmatchedPlugin<'a> {
+    plugin_slug: &'a str,
+    error: &'a str,
+}
+
+/// A whole installation as one JSON document; `unmatched` pairs each plugin
+/// that could not be compared with the reason.
+pub fn render_scan_json(
+    changed: &[Report],
+    unchanged: usize,
+    unmatched: &[(String, String)],
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let document = ScanDocument {
+        changed,
+        unchanged,
+        unmatched: unmatched
+            .iter()
+            .map(|(plugin_slug, error)| UnmatchedPlugin { plugin_slug, error })
+            .collect(),
+    };
+    serde_json::to_writer_pretty(&mut *out, &document)?;
+    writeln!(out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +673,35 @@ mod tests {
         let out = rendered(|buf| render_json(&report, buf));
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(parsed.get("latest_version").is_none());
+    }
+
+    #[test]
+    fn scan_json_is_a_single_document() {
+        let reports = vec![
+            report("akismet", "5.0", None, vec![], &[], &[]),
+            report("woo", "10.0", None, vec![], &[], &[]),
+        ];
+        let unmatched = vec![("private".to_string(), "not on wordpress.org".to_string())];
+        let out = rendered(|buf| render_scan_json(&reports, 3, &unmatched, buf));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(parsed["changed"][0]["plugin_slug"], "akismet");
+        assert_eq!(parsed["changed"][1]["summary"]["unchanged"], 5);
+        assert_eq!(parsed["unchanged"], 3);
+        assert_eq!(
+            parsed["unmatched"],
+            serde_json::json!([{ "plugin_slug": "private", "error": "not on wordpress.org" }])
+        );
+    }
+
+    #[test]
+    fn scan_json_of_a_clean_installation_is_still_a_document() {
+        let out = rendered(|buf| render_scan_json(&[], 4, &[], buf));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "changed": [], "unchanged": 4, "unmatched": [] })
+        );
     }
 
     #[test]

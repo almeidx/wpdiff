@@ -323,12 +323,15 @@ fn cmd_diff(args: &DiffArgs, dir: Option<&Path>, view: Format) -> Result<()> {
                 &mut out,
             )?;
         }
-        Format::Diff | Format::Json if scan.changed.is_empty() && scan.unmatched.is_empty() => {
+        Format::Json => {
+            output::render_scan_json(&scan.changed, scan.clean, &scan.unmatched, &mut out)?;
+        }
+        Format::Diff if scan.changed.is_empty() && scan.unmatched.is_empty() => {
             info!("All plugins match their upstream versions.");
         }
-        Format::Diff | Format::Json => {
+        Format::Diff => {
             for report in &scan.changed {
-                render(report, format, &mut out)?;
+                output::render_terminal(report, &mut out)?;
             }
             if scan.clean > 0 || !scan.unmatched.is_empty() {
                 output::render_scan_footer(
@@ -342,7 +345,7 @@ fn cmd_diff(args: &DiffArgs, dir: Option<&Path>, view: Format) -> Result<()> {
     }
 
     for (slug, reason) in &scan.unmatched {
-        warn!("{slug} - {reason:#}");
+        warn!("{slug} - {reason}");
     }
     Ok(())
 }
@@ -395,7 +398,7 @@ struct Scan {
     /// Number of plugins identical to upstream after filtering.
     clean: usize,
     /// Plugins that could not be compared, and why.
-    unmatched: Vec<(String, anyhow::Error)>,
+    unmatched: Vec<(String, String)>,
 }
 
 fn scan_all(dir: Option<&Path>, strict_whitespace: bool, filter: &Filter) -> Result<Scan> {
@@ -435,7 +438,7 @@ fn scan_all(dir: Option<&Path>, strict_whitespace: bool, filter: &Filter) -> Res
                 debug!("{}: no differences", meta.slug);
             }
             Ok(report) => scan.changed.push(report),
-            Err(e) => scan.unmatched.push((meta.slug, e)),
+            Err(e) => scan.unmatched.push((meta.slug, format!("{e:#}"))),
         }
     }
     Ok(scan)

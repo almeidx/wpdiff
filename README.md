@@ -109,10 +109,13 @@ and `.hg/` are always skipped during file walking.
 wpdiff akismet
 wpdiff akismet --json
 wpdiff summary akismet --json
+wpdiff --all --json
 ```
 
 Terminal output is optimized for review. JSON output is intended for scripts and
-automation.
+automation: one object per plugin, or with `--all` a single object holding the
+`changed` plugins, the `unchanged` count, and the `unmatched` plugins with the
+reason each could not be compared.
 
 ## Development
 
