@@ -623,6 +623,27 @@ mod tests {
     }
 
     #[test]
+    fn reapply_keeps_final_newline_and_line_endings() {
+        for (upstream, local) in [
+            ("one\ntwo\nthree\n", "one\ntwo\nTHREE\n"),
+            ("one\r\ntwo\r\nthree\r\n", "one\r\ntwo\r\nTHREE\r\n"),
+        ] {
+            let (local_dir, upstream_dir) = (staged(local), staged(upstream));
+            let patch = diff::diff_directories(local_dir.path(), upstream_dir.path(), false)
+                .unwrap()
+                .patch();
+
+            let reapplied = reapply(&patch, upstream_dir.path()).unwrap();
+
+            assert!(matches!(reapplied.verdict(), Verdict::Clean));
+            assert_eq!(
+                fs::read_to_string(upstream_dir.path().join("a.php")).unwrap(),
+                local
+            );
+        }
+    }
+
+    #[test]
     fn copy_reproduces_a_nested_tree_in_a_new_directory() {
         let src = tempfile::tempdir().unwrap();
         fs::create_dir_all(src.path().join("inc/deep")).unwrap();

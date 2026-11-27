@@ -341,14 +341,18 @@ fn read_text(path: &Path, strict_whitespace: bool) -> Result<String> {
     })
 }
 
+/// Unifies line endings and drops trailing whitespace. Every line ends with a
+/// newline, the last one included: diffs of normalized text are applied as
+/// patches, and a "no newline at end of file" marker would strip the final
+/// newline from the patched file.
 fn normalize_whitespace(content: &str) -> String {
-    content
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let unified = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut normalized = String::with_capacity(unified.len());
+    for line in unified.lines() {
+        normalized.push_str(line.trim_end());
+        normalized.push('\n');
+    }
+    normalized
 }
 
 const BUILD_DIRS: &[&str] = &["dist", "build"];
@@ -668,6 +672,20 @@ mod tests {
         );
         assert_eq!(diff.summary.unchanged, 2);
         assert!(diff.files.is_empty());
+    }
+
+    #[test]
+    fn default_diff_never_reports_a_missing_final_newline() {
+        let diff = diff_trees(
+            &[("a.php", "one\nTWO\n"), ("b.php", "kept\nlast")],
+            &[("a.php", "one\ntwo\n"), ("b.php", "kept\nlast\n")],
+            false,
+        );
+        assert_eq!(diff.summary.unchanged, 1);
+        assert_eq!(
+            diff.patch(),
+            "--- a/a.php\n+++ b/a.php\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+        );
     }
 
     #[test]
