@@ -89,7 +89,7 @@ so run `upgrade` from outside the plugin directory.
 
 ## Filtering
 
-Default output hides generated artifacts (`.min.js`, `vendor/`, etc.) and
+Default output hides generated artifacts (`.min.js`, `dist/`, etc.) and
 binary assets (images, fonts). Include more when you need it:
 
 ```sh

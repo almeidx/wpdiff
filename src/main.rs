@@ -68,7 +68,7 @@ struct DiffArgs {
 
 #[derive(Args, Default)]
 struct FilterArgs {
-    /// Include build artifacts (.min.js, vendor/, etc.)
+    /// Include build artifacts (.min.js, dist/, etc.)
     #[arg(long)]
     include_artifacts: bool,
 
