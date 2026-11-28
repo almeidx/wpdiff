@@ -174,10 +174,7 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
             Verdict::Clean => "  Replace live plugin with upgraded version?",
         };
         if !confirm(question)? {
-            println!(
-                "  Aborted. Staged version is in: {}",
-                staged_plugin.display()
-            );
+            println!("  Aborted. The installed plugin was not changed.");
             return Ok(());
         }
     }
