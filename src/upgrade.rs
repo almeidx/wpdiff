@@ -83,6 +83,7 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
     let (customizations, left_behind) =
         diff::diff_directories_in_full(&meta.dir, current_upstream.path(), opts.strict_whitespace)?
             .partition(&Filter::default());
+    let (customizations, left_behind) = set_aside_uncarriable(customizations, left_behind);
     let has_customizations = !customizations.files.is_empty();
     print_customizations(&customizations);
     print_left_behind(left_behind);
@@ -119,7 +120,12 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
     let patch_text = customizations.patch();
     let reapplied = if has_customizations {
         info!("Applying customizations to new version...");
-        let reapplied = reapply(&patch_text, &staged_plugin)?;
+        let mut reapplied = if patch_text.is_empty() {
+            Reapplied::default()
+        } else {
+            reapply(&patch_text, &staged_plugin)?
+        };
+        carry_empty_added_files(&customizations.files, &staged_plugin, &mut reapplied)?;
         print_reapply_summary(&reapplied);
         reapplied
     } else {
@@ -153,7 +159,7 @@ pub fn run(meta: &PluginMeta, opts: &Options) -> Result<()> {
         return Ok(());
     }
 
-    if matches!(verdict, Verdict::Failed) {
+    if matches!(verdict, Verdict::Failed) && !patch_text.is_empty() {
         let patch_path = artifact("-customizations.patch");
         save(&patch_path, &patch_text)?;
         println!("  Saved patch: {}", patch_path.bold());
@@ -234,7 +240,8 @@ fn print_left_behind(files: Vec<FileDiff>) {
     }
 
     println!(
-        "\n  {} {} changed files are build artifacts, assets or dependencies and are {}.",
+        "\n  {} {} changed files are build artifacts, assets or dependencies, or have no text \
+         diff, and are {}.",
         "⚠".yellow().bold(),
         files.len().to_string().bold(),
         "not carried over".yellow(),
@@ -269,6 +276,54 @@ fn print_left_behind(files: Vec<FileDiff>) {
             format!("-{deletions}").red(),
         );
     }
+}
+
+/// Moves removals and modifications without diff text to `left_behind`: the
+/// patch has nothing to carry them with.
+fn set_aside_uncarriable(
+    customizations: DirDiff,
+    mut left_behind: Vec<FileDiff>,
+) -> (DirDiff, Vec<FileDiff>) {
+    let unchanged = customizations.summary.unchanged;
+    let (carried, uncarriable): (Vec<_>, Vec<_>) = customizations
+        .files
+        .into_iter()
+        .partition(|f| f.status == diff::FileStatus::Added || !f.diff_text.is_empty());
+    left_behind.extend(uncarriable);
+    let carried = DirDiff::new(carried, SkippedDirs::default(), unchanged);
+    (carried, left_behind)
+}
+
+/// Creates the locally added files that are empty, which have no diff text
+/// and so are absent from the customizations patch.
+fn carry_empty_added_files(
+    files: &[FileDiff],
+    staged_plugin: &Path,
+    reapplied: &mut Reapplied,
+) -> Result<()> {
+    let empty_added = files
+        .iter()
+        .filter(|f| f.status == diff::FileStatus::Added && f.diff_text.is_empty());
+    for file in empty_added {
+        let path = staged_plugin.join(&file.path);
+        if fs::metadata(&path).is_ok_and(|existing| existing.len() > 0) {
+            reapplied.failed_files += 1;
+            println!(
+                "    {} {} - upstream now ships this file, your empty one was not carried over",
+                "✗".red().bold(),
+                file.path,
+            );
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, "").with_context(|| format!("Failed to create {}", path.display()))?;
+        reapplied.exact_files += 1;
+        debug!("  Created empty file: {}", file.path);
+    }
+    Ok(())
 }
 
 fn reapply(patch_text: &str, staged_plugin: &Path) -> Result<Reapplied> {
@@ -865,6 +920,40 @@ mod tests {
             fs::write(path, content).unwrap();
         }
         dir
+    }
+
+    fn empty_added_file(path: &str) -> Vec<FileDiff> {
+        let (local, upstream) = (dir_with(&[(path, "")]), dir_with(&[]));
+        let diff = diff::diff_directories(local.path(), upstream.path(), false).unwrap();
+        diff.files
+    }
+
+    #[test]
+    fn an_empty_added_file_is_created_in_the_staged_tree() {
+        let files = empty_added_file("inc/deep/empty.php");
+        let staged = dir_with(&[("main.php", "<?php\n")]);
+        let mut reapplied = Reapplied::default();
+
+        carry_empty_added_files(&files, staged.path(), &mut reapplied).unwrap();
+
+        assert!(matches!(reapplied.verdict(), Verdict::Clean));
+        assert_eq!(reapplied.exact_files, 1);
+        let created = fs::read(staged.path().join("inc/deep/empty.php")).unwrap();
+        assert!(created.is_empty());
+    }
+
+    #[test]
+    fn an_empty_added_file_never_replaces_one_upstream_now_ships() {
+        let files = empty_added_file("inc/new.php");
+        let staged = dir_with(&[("inc/new.php", "shipped\n")]);
+        let mut reapplied = Reapplied::default();
+
+        carry_empty_added_files(&files, staged.path(), &mut reapplied).unwrap();
+
+        assert!(matches!(reapplied.verdict(), Verdict::Failed));
+        assert_eq!((reapplied.exact_files, reapplied.failed_files), (0, 1));
+        let kept = fs::read_to_string(staged.path().join("inc/new.php")).unwrap();
+        assert_eq!(kept, "shipped\n");
     }
 
     fn entries(dir: &Path) -> Vec<String> {
