@@ -261,21 +261,33 @@ fn diff_walked(
             (false, _) => FileStatus::Added,
         };
 
-        let upstream_text = if status == FileStatus::Added {
+        let upstream_bytes = if status == FileStatus::Added {
             trace!("Added locally: {rel_path}");
-            String::new()
+            Vec::new()
         } else {
-            read_text(&upstream_dir.join(rel_path), strict_whitespace)?
+            read_bytes(&upstream_dir.join(rel_path))?
         };
-        let local_text = if status == FileStatus::Removed {
+        let local_bytes = if status == FileStatus::Removed {
             trace!("Removed from local: {rel_path}");
-            String::new()
+            Vec::new()
         } else {
-            read_text(&local_dir.join(rel_path), strict_whitespace)?
+            read_bytes(&local_dir.join(rel_path))?
         };
         pb.inc(1);
 
-        if status == FileStatus::Modified && upstream_text == local_text {
+        if status == FileStatus::Modified && upstream_bytes == local_bytes {
+            unchanged += 1;
+            continue;
+        }
+        let (upstream_text, upstream_is_utf8) = decode_text(&upstream_bytes, strict_whitespace);
+        let (local_text, local_is_utf8) = decode_text(&local_bytes, strict_whitespace);
+        // Different invalid byte runs all decode to U+FFFD, so equal texts
+        // only mean equal files when nothing was decoded lossily.
+        if status == FileStatus::Modified
+            && upstream_is_utf8
+            && local_is_utf8
+            && upstream_text == local_text
+        {
             unchanged += 1;
             continue;
         }
@@ -357,14 +369,21 @@ fn collect_files(dir: &Path, skip_dirs: &[&str]) -> Result<Tree> {
     })
 }
 
-fn read_text(path: &Path, strict_whitespace: bool) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let text = String::from_utf8_lossy(&bytes);
-    Ok(if strict_whitespace {
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+/// The text to diff, and whether `bytes` were valid UTF-8 rather than decoded
+/// lossily.
+fn decode_text(bytes: &[u8], strict_whitespace: bool) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+    let is_utf8 = matches!(text, std::borrow::Cow::Borrowed(_));
+    let text = if strict_whitespace {
         text.into_owned()
     } else {
         normalize_whitespace(&text)
-    })
+    };
+    (text, is_utf8)
 }
 
 /// Unifies line endings and drops trailing whitespace. Every line ends with a
@@ -669,6 +688,22 @@ mod tests {
         let diff = diff_trees(&[("empty.php", "")], &[], false);
         assert_eq!(paths(&diff), ["empty.php"]);
         assert_eq!(diff.files[0].status, FileStatus::Added);
+    }
+
+    #[test]
+    fn diff_directories_compares_invalid_utf8_files_by_bytes() {
+        let (local, upstream) = (tree(&[]), tree(&[]));
+        fs::write(local.path().join("a.bin"), b"a\xFFb\n").unwrap();
+        fs::write(upstream.path().join("a.bin"), b"a\xFEb\n").unwrap();
+        let diff = diff_directories(local.path(), upstream.path(), false).unwrap();
+        assert_eq!(paths(&diff), ["a.bin"]);
+        assert_eq!(diff.files[0].status, FileStatus::Modified);
+        assert_eq!(diff.summary.unchanged, 0);
+
+        fs::write(upstream.path().join("a.bin"), b"a\xFFb\n").unwrap();
+        let diff = diff_directories(local.path(), upstream.path(), false).unwrap();
+        assert!(diff.files.is_empty());
+        assert_eq!(diff.summary.unchanged, 1);
     }
 
     #[test]
