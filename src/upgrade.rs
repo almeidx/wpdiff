@@ -415,7 +415,20 @@ fn review_fuzzy_files(
         review.push_str(&unified);
 
         if interactive {
-            let resolved = resolve_file_hunks(rel_path, percent, &upstream_text, &patched_text)?;
+            let resolved = resolve_file_hunks(
+                rel_path,
+                percent,
+                &upstream_text,
+                &patched_text,
+                |section| {
+                    inquire::Select::new(
+                        &format!("  Section {section}:"),
+                        vec![Resolution::Ours, Resolution::Upstream, Resolution::Both],
+                    )
+                    .prompt()
+                    .context("Review cancelled; the installed plugin was left unchanged")
+                },
+            )?;
             fs::write(&patched_file, resolved)
                 .with_context(|| format!("Failed to write resolved {rel_path}"))?;
         } else {
@@ -490,13 +503,31 @@ fn resolve_file_hunks(
     match_percent: f64,
     upstream_text: &str,
     patched_text: &str,
+    mut choose: impl FnMut(usize) -> Result<Resolution>,
 ) -> Result<String> {
     let diff = TextDiff::from_lines(upstream_text, patched_text);
     let groups = diff.grouped_ops(CONTEXT_RADIUS);
 
-    let upstream_lines: Vec<&str> = upstream_text.lines().collect();
-    let patched_lines: Vec<&str> = patched_text.lines().collect();
-    let mut result_lines: Vec<&str> = Vec::new();
+    let eol_of = |text: &str| if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let upstream_eol = eol_of(upstream_text);
+    let patched_eol = eol_of(patched_text);
+    let upstream_lines: Vec<&str> = diff.iter_old_slices().collect();
+    let patched_lines: Vec<&str> = diff.iter_new_slices().collect();
+    let mut output = String::with_capacity(upstream_text.len().max(patched_text.len()));
+    let mut glue = "";
+    // Only the last line of a file can lack a terminator; `glue` supplies one when
+    // such a line ends up followed by another.
+    let mut push = |lines: &[&str], eol: &'static str| {
+        for line in lines {
+            output.push_str(glue);
+            output.push_str(line);
+            glue = if line.ends_with(['\n', '\r']) {
+                ""
+            } else {
+                eol
+            };
+        }
+    };
     let mut last_upstream_idx = 0;
 
     println!(
@@ -514,7 +545,10 @@ fn resolve_file_hunks(
         let upstream_range = first.old_range().start..last.old_range().end;
         let patched_range = first.new_range().start..last.new_range().end;
 
-        result_lines.extend_from_slice(&upstream_lines[last_upstream_idx..upstream_range.start]);
+        push(
+            &upstream_lines[last_upstream_idx..upstream_range.start],
+            upstream_eol,
+        );
         last_upstream_idx = upstream_range.end;
 
         println!(
@@ -538,41 +572,29 @@ fn resolve_file_hunks(
             }
         }
 
-        let resolution = inquire::Select::new(
-            &format!("  Section {}:", group_idx + 1),
-            vec![Resolution::Ours, Resolution::Upstream, Resolution::Both],
-        )
-        .prompt()
-        .context("Review cancelled; the installed plugin was left unchanged")?;
-
-        match resolution {
+        match choose(group_idx + 1)? {
             Resolution::Ours => {
-                result_lines.extend_from_slice(&patched_lines[patched_range]);
+                push(&patched_lines[patched_range], patched_eol);
                 println!("      {} Keeping our change", "→".green());
             }
             Resolution::Upstream => {
-                result_lines.extend_from_slice(&upstream_lines[upstream_range]);
+                push(&upstream_lines[upstream_range], upstream_eol);
                 println!("      {} Using upstream version", "→".yellow());
             }
             Resolution::Both => {
-                result_lines.extend_from_slice(&upstream_lines[upstream_range]);
-                let inserted = group
+                push(&upstream_lines[upstream_range], upstream_eol);
+                for op in group
                     .iter()
-                    .flat_map(|op| diff.iter_changes(op))
-                    .filter(|change| change.tag() == ChangeTag::Insert)
-                    .filter_map(|change| patched_lines.get(change.new_index()?));
-                result_lines.extend(inserted);
+                    .filter(|op| op.tag() != similar::DiffTag::Equal)
+                {
+                    push(&patched_lines[op.new_range()], patched_eol);
+                }
                 println!("      {} Keeping both versions", "→".cyan());
             }
         }
     }
 
-    result_lines.extend_from_slice(&upstream_lines[last_upstream_idx..]);
-
-    let mut output = result_lines.join("\n");
-    if upstream_text.ends_with('\n') || patched_text.ends_with('\n') {
-        output.push('\n');
-    }
+    push(&upstream_lines[last_upstream_idx..], upstream_eol);
 
     println!("    {} {} resolved\n", "✓".green().bold(), rel_path);
     Ok(output)
@@ -935,5 +957,35 @@ mod tests {
         .unwrap();
         assert_eq!(content, "deep\n");
         assert!(archive.by_name("main.php").is_ok());
+    }
+
+    #[test]
+    fn resolving_sections_keeps_crlf_line_endings() {
+        let fixture = |second: &str, twelfth: &str| -> String {
+            (1..=14)
+                .map(|number| match number {
+                    2 => format!("{second}\r\n"),
+                    12 => format!("{twelfth}\r\n"),
+                    _ => format!("line {number}\r\n"),
+                })
+                .collect()
+        };
+        let upstream = fixture("upstream 2", "upstream 12");
+        let patched = fixture("patched 2", "patched 12");
+        let resolve = |choices: [Resolution; 2]| {
+            let mut choices = choices.into_iter();
+            let choose = |_: usize| Ok(choices.next().unwrap());
+            resolve_file_hunks("main.php", 90.0, &upstream, &patched, choose).unwrap()
+        };
+
+        assert_eq!(resolve([Resolution::Ours, Resolution::Ours]), patched);
+        assert_eq!(
+            resolve([Resolution::Upstream, Resolution::Upstream]),
+            upstream
+        );
+        assert_eq!(
+            resolve([Resolution::Upstream, Resolution::Ours]),
+            fixture("upstream 2", "patched 12"),
+        );
     }
 }
