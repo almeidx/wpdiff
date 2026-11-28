@@ -414,7 +414,9 @@ pub fn render_scan_footer(
     unmatched: usize,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
-    writeln!(out)?;
+    if changed > 0 {
+        writeln!(out)?;
+    }
     writeln!(
         out,
         "{changed} changed, {clean} unchanged, {unmatched} unmatched"
@@ -821,5 +823,14 @@ mod tests {
     fn summary_table_is_silent_when_nothing_was_scanned() {
         let out = rendered(|buf| render_summary_table(&[], 0, 0, buf));
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn scan_footer_is_separated_only_from_reports() {
+        let out = rendered(|buf| render_scan_footer(2, 1, 0, buf));
+        assert_eq!(out, "\n2 changed, 1 unchanged, 0 unmatched\n");
+
+        let out = rendered(|buf| render_scan_footer(0, 3, 0, buf));
+        assert_eq!(out, "0 changed, 3 unchanged, 0 unmatched\n");
     }
 }

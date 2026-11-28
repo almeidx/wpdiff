@@ -365,21 +365,16 @@ fn cmd_diff(args: &DiffArgs, dir: Option<&Path>, view: Format) -> Result<()> {
         Format::Json => {
             output::render_scan_json(&scan.changed, scan.clean, &scan.unmatched, &mut out)?;
         }
-        Format::Diff if scan.changed.is_empty() && scan.unmatched.is_empty() => {
-            info!("All plugins match their upstream versions.");
-        }
         Format::Diff => {
             for report in &scan.changed {
                 output::render_terminal(report, &mut out)?;
             }
-            if scan.clean > 0 || !scan.unmatched.is_empty() {
-                output::render_scan_footer(
-                    scan.changed.len(),
-                    scan.clean,
-                    scan.unmatched.len(),
-                    &mut out,
-                )?;
-            }
+            output::render_scan_footer(
+                scan.changed.len(),
+                scan.clean,
+                scan.unmatched.len(),
+                &mut out,
+            )?;
         }
     }
 
