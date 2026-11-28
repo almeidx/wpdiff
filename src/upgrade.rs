@@ -938,8 +938,8 @@ mod tests {
 
         assert!(matches!(reapplied.verdict(), Verdict::Clean));
         assert_eq!(reapplied.exact_files, 1);
-        let created = fs::read(staged.path().join("inc/deep/empty.php")).unwrap();
-        assert!(created.is_empty());
+        let created = fs::read_to_string(staged.path().join("inc/deep/empty.php")).unwrap();
+        assert_eq!(created, "");
     }
 
     #[test]
