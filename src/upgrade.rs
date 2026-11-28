@@ -324,9 +324,7 @@ fn reapply(patch_text: &str, staged_plugin: &Path) -> Result<Reapplied> {
                 let _ = write!(
                     reapplied.rejects,
                     "--- Failed hunk #{} in {} ---\n{:?}\n\n",
-                    failure.hunk_index + 1,
-                    file,
-                    failure.reason,
+                    failure.hunk_index, file, failure.reason,
                 );
             }
         } else if let Some(score) = worst_score {
@@ -732,7 +730,11 @@ mod tests {
 
         assert!(matches!(reapplied.verdict(), Verdict::Failed));
         assert_eq!(reapplied.failed_files, 1);
-        assert!(reapplied.rejects.contains("a.php"));
+        assert!(
+            reapplied
+                .rejects
+                .starts_with("--- Failed hunk #1 in a.php ---")
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("a.php")).unwrap(),
             rewritten
