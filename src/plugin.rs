@@ -82,8 +82,9 @@ pub fn discover_plugin(path: &Path) -> Result<PluginMeta> {
 
 /// Discovers every directory under the installation's plugins directory; the
 /// ones that are not plugins come back as errors.
-pub fn discover_all(wp_path: &Path) -> Result<Vec<Result<PluginMeta>>> {
-    let plugins_dir = find_plugins_dir(wp_path)?;
+pub fn discover_all(base_dir: Option<&Path>) -> Result<Vec<Result<PluginMeta>>> {
+    let plugins_dir = plugins_dir(&resolve_base(base_dir)?);
+    debug!("Scanning all plugins in {}", plugins_dir.display());
     let mut results = Vec::new();
 
     for entry in fs::read_dir(&plugins_dir)? {
@@ -96,41 +97,56 @@ pub fn discover_all(wp_path: &Path) -> Result<Vec<Result<PluginMeta>>> {
     Ok(results)
 }
 
-fn find_plugins_dir(path: &Path) -> Result<PathBuf> {
-    let candidates = [
-        path.join("wp-content/plugins"),
-        path.join("plugins"),
-        path.to_path_buf(),
-    ];
+/// Canonical form of `-C`, or of the current directory when `-C` is absent. A
+/// relative path such as `.` has no ancestors to search until it is canonical.
+fn resolve_base(base_dir: Option<&Path>) -> Result<PathBuf> {
+    let base = match base_dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().context(
+            "Could not determine the current directory. \
+             Use -C to specify the WordPress root directory.",
+        )?,
+    };
 
-    candidates
-        .into_iter()
+    let canonical = base.canonicalize().with_context(|| {
+        format!(
+            "Could not open directory {}.\n\
+             Use -C to specify the WordPress root directory.",
+            base.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        bail!(
+            "{} is not a directory.\n\
+             Use -C to specify the WordPress root directory.",
+            base.display()
+        );
+    }
+
+    Ok(canonical)
+}
+
+/// The plugins directory that `base` (canonical) belongs to: the nearest
+/// `wp-content/plugins` at or above it, else `base/plugins` (`base` is
+/// `wp-content`), else `base` itself (`base` is the plugins directory).
+fn plugins_dir(base: &Path) -> PathBuf {
+    base.ancestors()
+        .map(|dir| dir.join("wp-content/plugins"))
+        .chain(std::iter::once(base.join("plugins")))
         .find(|candidate| candidate.is_dir())
-        .with_context(|| {
-            format!(
-                "Could not find wp-content/plugins/ in {}.\n\
-                 Use -C to specify the WordPress root directory.",
-                path.display()
-            )
-        })
+        .unwrap_or_else(|| base.to_path_buf())
 }
 
 pub fn resolve_plugin_path(slug_or_path: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
-    let base = match base_dir {
-        Some(d) => d.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
+    let base = resolve_base(base_dir)?;
 
     let relative = base.join(slug_or_path);
     if relative.is_dir() {
         return Ok(relative);
     }
 
-    if let Some(installed) = base
-        .ancestors()
-        .map(|root| root.join("wp-content/plugins").join(slug_or_path))
-        .find(|candidate| candidate.is_dir())
-    {
+    let installed = plugins_dir(&base).join(slug_or_path);
+    if installed.is_dir() {
         return Ok(installed);
     }
 
@@ -227,7 +243,7 @@ mod tests {
         let dir = root.path().join("test-plugin");
         fs::create_dir(&dir).unwrap();
 
-        let resolved = resolve_plugin_path(dir.to_str().unwrap(), None).unwrap();
+        let resolved = resolve_plugin_path(dir.to_str().unwrap(), Some(root.path())).unwrap();
         assert_eq!(resolved, dir);
     }
 
@@ -238,7 +254,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let resolved = resolve_plugin_path("akismet", Some(root.path())).unwrap();
-        assert_eq!(resolved, dir);
+        assert_eq!(resolved, dir.canonicalize().unwrap());
     }
 
     #[test]
@@ -250,7 +266,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
 
         let resolved = resolve_plugin_path("akismet", Some(&nested)).unwrap();
-        assert_eq!(resolved, dir);
+        assert_eq!(resolved, dir.canonicalize().unwrap());
     }
 
     #[test]
@@ -260,34 +276,37 @@ mod tests {
     }
 
     #[test]
-    fn find_plugins_dir_standard() {
+    fn plugins_dir_standard() {
         let root = tempfile::tempdir().unwrap();
         let plugins = root.path().join("wp-content/plugins");
         fs::create_dir_all(&plugins).unwrap();
 
-        assert_eq!(find_plugins_dir(root.path()).unwrap(), plugins);
+        let base = resolve_base(Some(root.path())).unwrap();
+        assert_eq!(plugins_dir(&base), plugins.canonicalize().unwrap());
     }
 
     #[test]
-    fn find_plugins_dir_inside_wp_content() {
+    fn plugins_dir_inside_wp_content() {
         let root = tempfile::tempdir().unwrap();
         let plugins = root.path().join("plugins");
         fs::create_dir_all(&plugins).unwrap();
         fs::create_dir_all(root.path().join("themes")).unwrap();
 
-        assert_eq!(find_plugins_dir(root.path()).unwrap(), plugins);
+        let base = resolve_base(Some(root.path())).unwrap();
+        assert_eq!(plugins_dir(&base), plugins.canonicalize().unwrap());
     }
 
     #[test]
-    fn find_plugins_dir_accepts_the_plugins_directory_itself() {
+    fn plugins_dir_accepts_the_plugins_directory_itself() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(find_plugins_dir(root.path()).unwrap(), root.path());
+        let base = resolve_base(Some(root.path())).unwrap();
+        assert_eq!(plugins_dir(&base), root.path().canonicalize().unwrap());
     }
 
     #[test]
-    fn find_plugins_dir_not_found() {
+    fn resolve_base_rejects_missing_directory() {
         let root = tempfile::tempdir().unwrap();
-        assert!(find_plugins_dir(&root.path().join("does-not-exist")).is_err());
+        assert!(resolve_base(Some(&root.path().join("does-not-exist"))).is_err());
     }
 
     #[test]
@@ -309,7 +328,7 @@ mod tests {
         plugin_dir(&plugins, "not-a-plugin", "readme.txt", "not a plugin");
         fs::write(plugins.join("index.php"), "<?php // Silence is golden.\n").unwrap();
 
-        let results = discover_all(root.path()).unwrap();
+        let results = discover_all(Some(root.path())).unwrap();
         let mut slugs: Vec<&str> = results
             .iter()
             .filter_map(|r| r.as_ref().ok())
@@ -319,5 +338,28 @@ mod tests {
 
         assert_eq!(slugs, ["akismet", "hello-dolly"]);
         assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+    }
+
+    #[test]
+    fn discover_all_from_themes_directory_lists_plugins() {
+        let root = tempfile::tempdir().unwrap();
+        plugin_dir(
+            &root.path().join("wp-content/plugins"),
+            "akismet",
+            "akismet.php",
+            "<?php\n/*\nPlugin Name: Akismet\nVersion: 5.0\n*/\n",
+        );
+        let themes = root.path().join("wp-content/themes");
+        fs::create_dir_all(themes.join("mine")).unwrap();
+
+        let results = discover_all(Some(&themes)).unwrap();
+        let slugs: Vec<&str> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|m| m.slug.as_str())
+            .collect();
+
+        assert_eq!(slugs, ["akismet"]);
+        assert_eq!(results.len(), 1);
     }
 }

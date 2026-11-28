@@ -438,10 +438,7 @@ struct Scan {
 fn scan_all(dir: Option<&Path>, strict_whitespace: bool, filter: &Filter) -> Result<Scan> {
     use rayon::prelude::*;
 
-    let base = dir.unwrap_or_else(|| Path::new("."));
-    debug!("Scanning all plugins in {}", base.display());
-
-    let mut plugins: Vec<PluginMeta> = plugin::discover_all(base)?
+    let mut plugins: Vec<PluginMeta> = plugin::discover_all(dir)?
         .into_iter()
         .filter_map(|discovered| discovered.inspect_err(|e| warn!("{e:#}")).ok())
         .collect();
