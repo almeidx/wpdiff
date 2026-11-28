@@ -28,8 +28,9 @@ pub fn locate(slug_or_path: &str, base_dir: Option<&Path>) -> Result<PluginMeta>
 }
 
 fn parse_plugin_header(dir: &Path, file: &Path) -> Result<Option<PluginMeta>> {
-    let content =
-        fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
+    // Older plugins ship PHP files in legacy encodings such as ISO-8859-1.
+    let bytes = fs::read(file).with_context(|| format!("Failed to read {}", file.display()))?;
+    let content = String::from_utf8_lossy(&bytes);
 
     let Some(name) = extract_match(&PLUGIN_NAME, &content) else {
         return Ok(None);
@@ -227,6 +228,23 @@ mod tests {
 
         let meta = discover_plugin(&dir).unwrap();
         assert_eq!(meta.name, "Akismet");
+    }
+
+    #[test]
+    fn discover_reads_php_files_that_are_not_utf8() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("legacy");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a-helper.php"), b"<?php\n// caf\xe9\n").unwrap();
+        fs::write(
+            dir.join("legacy.php"),
+            b"<?php\n/*\nPlugin Name: Legacy\nDescription: caf\xe9\nVersion: 1.2\n*/\n",
+        )
+        .unwrap();
+
+        let meta = discover_plugin(&dir).unwrap();
+        assert_eq!(meta.name, "Legacy");
+        assert_eq!(meta.version, "1.2");
     }
 
     #[test]
